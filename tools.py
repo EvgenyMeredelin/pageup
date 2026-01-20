@@ -4,31 +4,28 @@ from zoneinfo import ZoneInfo
 
 import emoji
 
-from settings import SBERCHAT_BASE_URL
 
-
-moscow_timezone = ZoneInfo("Europe/Moscow")
-
+SBERCHAT_BASE_URL = "https://sberchat.sberbank.ru/"
 group_url_pattern = re.compile(
     fr"{SBERCHAT_BASE_URL}#/chat/group\d+"
 )
-
 time_pattern = re.compile(r"\d\d:\d\d(.+)")
+moscow_timezone = ZoneInfo("Europe/Moscow")
 
 
-def remove_time_prefix(text: str) -> str:
-    """Remove time prefix. """
-    return time_pattern.sub(r"\g<1>", text)
+def remove_time_prefix(string: str) -> str:
+    """Remove time prefix from a string. """
+    return time_pattern.sub(r"\g<1>", string)
 
 
-def remove_emoji(text: str) -> str:
-    """Remove emoji. """
-    return emoji.replace_emoji(text)
+def remove_emoji(string: str) -> str:
+    """Remove emoji from a string. """
+    return emoji.replace_emoji(string)
 
 
-def remove_redundant_spaces(text: str) -> str:
-    """Remove redundant whitespaces. """
-    return " ".join(text.split())
+def remove_redundant_whitespaces(string: str) -> str:
+    """Remove redundant whitespaces from a string. """
+    return " ".join(string.split())
 
 
 class Pipeline:
@@ -48,5 +45,5 @@ class Pipeline:
 cleaner = Pipeline(
     remove_time_prefix,
     remove_emoji,
-    remove_redundant_spaces
+    remove_redundant_whitespaces
 )

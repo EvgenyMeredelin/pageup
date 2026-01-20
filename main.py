@@ -23,7 +23,7 @@ if __name__ == "__main__":
         options.add_argument("--disable-features=SberSync")
         service = Service(SBERBROWSER_DRIVER)
         driver = Chrome(options, service)
-    # personal device: SberChat history limited to 7 days
+    # personal device: SberChat history limited to one week
     else:
         driver = Chrome()
 
@@ -44,14 +44,14 @@ if __name__ == "__main__":
     print("Task parameters:", task_model_dump, sep="\n")
 
     # SLEEP_TIME required to confirm personal certificate, enter OTP password,
-    # scroll chat down to the most recent message, and focus cursor inside.
+    # scroll the chat down to the most recent message, and focus cursor inside.
     pad_width = len(str(SLEEP_TIME))
 
     for sec in range(SLEEP_TIME, 0, -1):
         print(f"Seconds to start: {sec:0{pad_width}}", end="\r", flush=True)
         time.sleep(1)
 
-    print("\nStarting...")
+    print("Seconds to start: Started...")
 
     try:
         while True:
@@ -60,6 +60,7 @@ if __name__ == "__main__":
             new_messages = task.collect_messages(soup)
 
             if task.is_done(new_messages[-1]):
+                print(f"Messages collected: {len(messages)}")
                 task.write_json(messages)
                 break
 
@@ -68,7 +69,8 @@ if __name__ == "__main__":
             actions.perform()
             time.sleep(1)
 
-    # since task's min_date may be unreachable (e.g. chat created later)
-    # we need a manual stopper that takes care about collected messages
+    # since min_date may be unreachable (e.g. chat created later than expected)
+    # we need a manual stopper that takes care about the collected messages
     except KeyboardInterrupt:
+        print(f"Messages collected: {len(messages)}")
         task.write_json(messages)
