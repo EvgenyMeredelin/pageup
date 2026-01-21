@@ -65,7 +65,7 @@ class Message(BaseMessage):
 
     @model_serializer(when_used="always")
     def rearrange_fields(self) -> msg_dump:
-        # exclude `message_id`
+        # rearrange fields and exclude `message_id`
         return {
             "date": self.date,
             "sender_url": self.sender_url,
@@ -78,8 +78,9 @@ class Message(BaseMessage):
         return hash(self.message_id)
 
     def __eq__(self, other) -> bool:
-        if not isinstance(other, self.__class__):
-            return NotImplemented
+        # YAGNI
+        # if not isinstance(other, self.__class__):
+        #     return NotImplemented
         return self.message_id == other.message_id
 
     def __bool__(self) -> bool:

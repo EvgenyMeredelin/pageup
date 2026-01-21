@@ -51,7 +51,7 @@ if __name__ == "__main__":
         print(f"Seconds to start: {sec:0{pad_width}}", end="\r", flush=True)
         time.sleep(1)
 
-    print("Seconds to start: Started...")
+    print("Seconds to start: Parsing started...")
 
     try:
         while True:
