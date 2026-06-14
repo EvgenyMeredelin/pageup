@@ -125,6 +125,9 @@ Re-login, then:
 
 Output: ~/projects/pageup-results/AI in Dev Community.json.
 
+Thread replies (green "N ответа" bubbles) are collected automatically during
+scrolling; busy channels take significantly longer than message-only runs.
+
 During --sleep-time countdown: scroll to the latest message and click inside
 the chat for keyboard focus.  If the browser window is open but the client
 certificate (.p12) picker never appeared, stop (Ctrl+C) and restart.

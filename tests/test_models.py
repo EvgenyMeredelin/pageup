@@ -2,11 +2,18 @@
 
 Covers:
     Message       — timestamp parsing, equality/hash, __bool__, patch(), serialisation
+    Entry         — field_serializer strips None slots from attachments
     ParsingTask   — validation (incl. null-byte and dotted names), collect_messages()
-                    (incl. malformed data-message-date skip), is_done(), write_json
-    Quote/Attachment — minimal Pydantic model smoke tests
+                    (incl. malformed data-message-date skip, thread_reply_count,
+                    main/thread scope isolation, image attachment detection,
+                    file-block produces no attachment record),
+                    collect_thread_reply_entries() (incl. quotes forwarding,
+                    message_id included in Entry),
+                    is_done(), write_json (incl. thread_replies),
+                    message_id normalization (| → _)
+    Quote         — minimal Pydantic model smoke test
 
-Uses HTML fixtures from tests.fixtures; no Selenium or filesystem beyond temp dirs.
+Uses HTML fixtures from tests.fixtures and tests/data/; no Selenium.
 """
 
 import json
@@ -19,19 +26,30 @@ from unittest.mock import patch
 from bs4 import BeautifulSoup
 from pydantic import ValidationError
 
-from pageup.config import MSG_WRAP_CLS
-from pageup.models import Attachment, Message, ParsingTask, Quote
+from pageup.config import MSG_LIST_CONTAINER_CLS, MSG_WRAP_CLS, THREAD_PANEL_CLS
+from pageup.models import Entry, Message, ParsingTask, Quote
 from pageup.tools import moscow_timezone
 from tests.fixtures import (
     ABSOLUTE_SENDER_URL_HTML,
     ATTACHMENT_ONLY_HTML,
+    BLOCK_MESSAGE_TEXT_HTML,
     CONTINUATION_PAIR_HTML,
     GROUP_URL,
+    IMAGE_ATTACHMENT_HTML,
+    IMAGE_WITH_TEXT_HTML,
+    VIDEO_ATTACHMENT_HTML,
     INCOMPLETE_MESSAGE_HTML,
+    MAIN_AND_THREAD_PANEL_HTML,
+    MESSAGE_WITH_THREAD_BUBBLE_HTML,
     MESSY_TEXT_HTML,
     QUOTE_FALLBACK_HTML,
+    THREAD_PANEL_SAMPLE_HTML,
+    image_attachment_block,
+    multi_attachment_block,
     quote_block,
+    video_attachment_block,
     SAMPLE_MESSAGE_HTML,
+    thread_bubble,
     TS_2024_01_15,
     TS_2024_09_01,
     TWO_MESSAGES_HTML,
@@ -96,17 +114,52 @@ class MessageTests(unittest.TestCase):
         self.assertTrue(msg)
 
     def test_bool_with_attachments_only(self) -> None:
-        # Attachment-only rows survive _unique_reversed filtering.
+        # Image attachment rows survive _unique_reversed filtering.
         msg = self._message(
             content="",
-            attachments=[Attachment(name="f.pdf", size=None)],
+            attachments=["downloaded_image_0.png"],
         )
         self.assertTrue(msg)
 
+    def test_rearrange_fields_strips_empty_string_slots(self) -> None:
+        # Skipped video placeholders ("") must not appear in JSON output.
+        msg = self._message(
+            content="hi",
+            attachments=["img.png", ""],
+        )
+        dumped = msg.model_dump()
+        self.assertEqual(dumped["attachments"], ["img.png"])
+
+    def test_bool_with_thread_reply_count_only(self) -> None:
+        msg = self._message(content="").model_copy(update={"thread_reply_count": 3})
+        self.assertTrue(msg)
+
+    def test_bool_with_thread_replies_only(self) -> None:
+        base = self._message(content="")
+        reply = Entry(
+            message_id="reply-1",
+            date=base.date,
+            sender_url=None,
+            sender_name="Bob",
+            attachments=None,
+            content="reply",
+        )
+        msg = base.model_copy(update={"thread_replies": [reply]})
+        self.assertTrue(msg)
+
     def test_bool_false_when_empty(self) -> None:
-        # Empty content + no attachments → falsy, dropped in post-processing.
+        # Empty content, no attachments, no thread bubble → falsy.
         msg = self._message(content="")
         self.assertFalse(msg)
+
+    def test_bool_false_when_only_skipped_attachment_slots(self) -> None:
+        # Skipped video placeholders ("") must not keep an otherwise empty row.
+        msg = self._message(content="", attachments=[""])
+        self.assertFalse(msg)
+
+    def test_bool_true_when_pending_attachment_slots(self) -> None:
+        msg = self._message(content="", attachments=[None])
+        self.assertTrue(msg)
 
     def test_equality_and_hash_by_message_id(self) -> None:
         # dict.fromkeys deduplication in _unique_reversed relies on this.
@@ -121,10 +174,9 @@ class MessageTests(unittest.TestCase):
         msg = self._message()
         self.assertFalse(msg == "same")
 
-    def test_model_dump_excludes_message_id(self) -> None:
-        # rearrange_fields serializer omits internal dedup key from JSON output.
+    def test_model_dump_includes_message_id(self) -> None:
         dumped = self._message().model_dump()
-        self.assertNotIn("message_id", dumped)
+        self.assertEqual(dumped["message_id"], "id")
         self.assertIn("content", dumped)
         self.assertIn("attachments", dumped)
 
@@ -150,7 +202,7 @@ class MessageTests(unittest.TestCase):
         self,
         message_id: str = "id",
         content: str = "hi",
-        attachments: list[Attachment] | None = None,
+        attachments: list[str | None] | None = None,
     ) -> Message:
         return Message(
             message_id=message_id,
@@ -286,8 +338,8 @@ class ParsingTaskTests(unittest.TestCase):
         )
         self.assertEqual(len(msg.quotes or []), 1)
         self.assertEqual(msg.quotes[0].content, "Earlier text")
-        self.assertEqual(len(msg.attachments or []), 1)
-        self.assertEqual(msg.attachments[0].name, "report.pdf")
+        # SAMPLE_MESSAGE_HTML uses image_attachment_block → one None slot.
+        self.assertEqual(msg.attachments, [None])
 
     def test_collect_messages_skips_rows_without_data_attributes(self) -> None:
         soup = BeautifulSoup(INCOMPLETE_MESSAGE_HTML, "lxml")
@@ -312,11 +364,50 @@ class ParsingTaskTests(unittest.TestCase):
         messages = self._task().collect_messages(soup)
         self.assertEqual([m.message_id for m in messages], ["msg-new", "msg-old"])
 
-    def test_collect_messages_attachment_only(self) -> None:
+    def test_collect_messages_file_attachment_only_no_record(self) -> None:
+        # File blocks are skipped by _collect_attachments — only image blocks count.
         soup = BeautifulSoup(ATTACHMENT_ONLY_HTML, "lxml")
         msg = self._task().collect_messages(soup)[0]
         self.assertEqual(msg.content, "")
-        self.assertEqual(msg.attachments[0].name, "slides.pptx")
+        self.assertIsNone(msg.attachments)
+
+    def test_collect_messages_multi_file_attachment_block_no_record(self) -> None:
+        # Multi-file blocks contain no image wrap → _collect_attachments returns None.
+        html = message_row(
+            "msg-multi-file",
+            TS_2024_09_01,
+            content="",
+            attachments_html=multi_attachment_block(
+                ("settings.txt", "8.4 КБ"),
+                ("settings.json", "830 Б"),
+            ),
+        )
+        msg = self._task().collect_messages(BeautifulSoup(html, "lxml"))[0]
+        self.assertIsNone(msg.attachments)
+
+    def test_collect_messages_file_blocks_from_real_dom_excerpt_no_record(self) -> None:
+        # File attachment blocks in real DOM produce no attachment record (images only).
+        from pathlib import Path
+
+        excerpt = (
+            Path(__file__).resolve().parents[2]
+            / "obsidian-sber/various/sberchat-example.html"
+        )
+        if not excerpt.is_file():
+            self.skipTest(f"DOM excerpt not found: {excerpt}")
+        html = excerpt.read_text(encoding="utf-8")
+        soup = BeautifulSoup(html, "lxml")
+        task = self._task()
+        for wrap in soup.find_all("div", class_=MSG_WRAP_CLS):
+            if wrap.get("data-message-id", "").startswith("-2511463158072143375"):
+                messages = task._collect_row_messages(
+                    BeautifulSoup(str(wrap), "lxml"), scope="main"
+                )
+                self.assertEqual(len(messages), 1)
+                # File blocks only → no image slots recorded.
+                self.assertIsNone(messages[0].attachments)
+                return
+        self.fail("Baranyuk Jenkins message row not found in DOM excerpt")
 
     def test_collect_messages_quote_fallback(self) -> None:
         # QUOTE_CONTENT_SEL missing → full wrapper text + cleaner.
@@ -392,12 +483,56 @@ class ParsingTaskTests(unittest.TestCase):
         result = ParsingTask._unique_reversed([m2, m1, dup])
         self.assertEqual([m.message_id for m in result], ["a", "b"])
 
+    def test_unique_reversed_sorts_chronologically(self) -> None:
+        older = self._make_message("a", "first", TS_2024_01_15)
+        newer = self._make_message("b", "second", TS_2024_09_01)
+        result = ParsingTask._unique_reversed([older, newer])
+        self.assertEqual([m.message_id for m in result], ["a", "b"])
+        self.assertLess(result[0].date, result[1].date)
+
+    def test_prefer_richer_keeps_existing_replies_on_equal_count(self) -> None:
+        base = self._make_message("t1", "parent", TS_2024_09_01)
+        disk_reply = Entry(
+            message_id="reply-1",
+            date=base.date,
+            sender_url=None,
+            sender_name="Bob",
+            attachments=None,
+            content="from disk",
+        )
+        dom_reply = Entry(
+            message_id="reply-1",
+            date=base.date,
+            sender_url=None,
+            sender_name="Bob",
+            attachments=None,
+            content="from dom",
+        )
+        existing = base.model_copy(
+            update={"thread_reply_count": 1, "thread_replies": [disk_reply]}
+        )
+        incoming = base.model_copy(
+            update={"thread_reply_count": 1, "thread_replies": [dom_reply]}
+        )
+        merged = ParsingTask.prefer_richer_message(existing, incoming)
+        self.assertEqual(merged.thread_replies[0].content, "from disk")
+
     def test_unique_reversed_filters_falsy_messages(self) -> None:
         empty = self._make_message("empty", "", TS_2024_09_01)
         good = self._make_message("good", "text", TS_2024_09_01)
         result = ParsingTask._unique_reversed([good, empty])
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].message_id, "good")
+
+    def test_unique_reversed_keeps_thread_only_message(self) -> None:
+        html = message_row(
+            "thread-only",
+            TS_2024_09_01,
+            content="",
+            thread_html=thread_bubble(2),
+        )
+        threaded = self._task().collect_messages(BeautifulSoup(html, "lxml"))[0]
+        self.assertEqual(len(ParsingTask._unique_reversed([threaded])), 1)
 
     def test_patch_backfills_continuation_in_chronological_list(self) -> None:
         soup = BeautifulSoup(CONTINUATION_PAIR_HTML, "lxml")
@@ -427,7 +562,241 @@ class ParsingTaskTests(unittest.TestCase):
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(len(data), 2)
             self.assertEqual(data[1]["sender_name"], "Alice")
-            self.assertNotIn("message_id", data[0])
+            self.assertIn("message_id", data[0])
+
+    def test_collect_messages_parses_thread_reply_count(self) -> None:
+        soup = BeautifulSoup(MESSAGE_WITH_THREAD_BUBBLE_HTML, "lxml")
+        msg = self._task().collect_messages(soup)[0]
+        self.assertEqual(msg.thread_reply_count, 3)
+        self.assertIsNone(msg.thread_replies)
+
+    def test_parse_thread_reply_count_variants(self) -> None:
+        for count in (1, 3, 8):
+            html = message_row(
+                f"msg-{count}",
+                TS_2024_09_01,
+                thread_html=thread_bubble(count),
+            )
+            row = BeautifulSoup(html, "lxml").find("div", class_=MSG_WRAP_CLS)
+            self.assertEqual(ParsingTask._parse_thread_reply_count(row), count)
+
+    def test_main_scope_ignores_thread_panel_rows(self) -> None:
+        soup = BeautifulSoup(MAIN_AND_THREAD_PANEL_HTML, "lxml")
+        messages = self._task().collect_messages(soup)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].message_id, "msg-main")
+
+    def test_main_scope_ignores_panel_only_dom(self) -> None:
+        soup = BeautifulSoup(THREAD_PANEL_SAMPLE_HTML, "lxml")
+        messages = self._task().collect_messages(soup)
+        self.assertEqual(messages, [])
+
+    def test_collect_messages_rejects_unknown_scope(self) -> None:
+        soup = BeautifulSoup(SAMPLE_MESSAGE_HTML, "lxml")
+        with self.assertRaises(ValueError):
+            self._task().collect_messages(soup, scope="sidebar")
+
+    def test_collect_thread_reply_entries_excludes_root(self) -> None:
+        soup = BeautifulSoup(THREAD_PANEL_SAMPLE_HTML, "lxml")
+        task = self._task()
+        entries = task.collect_thread_reply_entries(soup, "msg-root")
+        self.assertEqual(len(entries), 2)
+        self.assertEqual({e.message_id for e in entries}, {"reply-1", "reply-2"})
+        self.assertEqual(entries[0].content, "First reply")
+
+    def test_thread_scope_ignores_main_feed_when_panel_closed(self) -> None:
+        soup = BeautifulSoup(TWO_MESSAGES_HTML, "lxml")
+        entries = self._task().collect_thread_reply_entries(soup, "msg-old")
+        self.assertEqual(entries, [])
+
+    def test_real_html_thread_panel_parsing(self) -> None:
+        fixture = Path(__file__).resolve().parent / "data" / "sberchat-thread-panel-excerpt.html"
+        if not fixture.is_file():
+            self.skipTest(f"DOM excerpt fixture missing: {fixture}")
+        html = fixture.read_text(encoding="utf-8")
+        soup = BeautifulSoup(html, "lxml")
+        task = self._task()
+        entries = task.collect_thread_reply_entries(
+            soup,
+            "-6968472423308848655_-1719553178633880992",
+        )
+        self.assertEqual(len(entries), 3)
+        self.assertIn("export PATH", entries[0].content)
+
+    def test_block_message_div_content(self) -> None:
+        soup = BeautifulSoup(BLOCK_MESSAGE_TEXT_HTML, "lxml")
+        msg = self._task().collect_messages(soup)[0]
+        self.assertEqual(msg.content, "Block body text")
+
+    def test_write_json_includes_thread_fields(self) -> None:
+        base = self._make_message("t1", "parent", TS_2024_09_01)
+        reply = Entry(
+            message_id="reply-1",
+            date=base.date,
+            sender_url=None,
+            sender_name="Bob",
+            attachments=None,
+            content="reply text",
+        )
+        msg = base.model_copy(
+            update={"thread_reply_count": 2, "thread_replies": [reply]}
+        )
+        task = self._task()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("builtins.print"):
+                task.write_json([msg], tmp)
+            data = json.loads((Path(tmp) / "test.json").read_text(encoding="utf-8"))
+            self.assertEqual(data[0]["thread_reply_count"], 2)
+            self.assertEqual(len(data[0]["thread_replies"]), 1)
+            self.assertEqual(data[0]["thread_replies"][0]["sender_name"], "Bob")
+            self.assertIn("message_id", data[0]["thread_replies"][0])
+
+    def test_prefer_richer_message_keeps_longer_thread(self) -> None:
+        base = self._make_message("t1", "parent", TS_2024_09_01)
+        short = base.model_copy(update={"thread_replies": None})
+        reply = Entry(
+            message_id="reply-1",
+            date=base.date,
+            sender_url=None,
+            sender_name="Bob",
+            attachments=None,
+            content="reply",
+        )
+        rich = base.model_copy(
+            update={"thread_reply_count": 2, "thread_replies": [reply]}
+        )
+        self.assertIs(
+            ParsingTask.prefer_richer_message(short, rich).thread_replies,
+            rich.thread_replies,
+        )
+        self.assertEqual(
+            len(ParsingTask.prefer_richer_message(rich, short).thread_replies or []),
+            1,
+        )
+
+    def test_thread_is_complete(self) -> None:
+        base = self._make_message("t1", "parent", TS_2024_09_01)
+        reply = Entry(
+            message_id="reply-1",
+            date=base.date,
+            sender_url=None,
+            sender_name="Bob",
+            attachments=None,
+            content="reply",
+        )
+        partial = base.model_copy(
+            update={"thread_reply_count": 2, "thread_replies": [reply]}
+        )
+        complete = base.model_copy(
+            update={"thread_reply_count": 1, "thread_replies": [reply]}
+        )
+        self.assertFalse(ParsingTask.thread_is_complete(partial))
+        self.assertTrue(ParsingTask.thread_is_complete(complete))
+
+    def test_file_attachment_with_status_produces_no_record(self) -> None:
+        # File blocks (even with status labels) have no image wrap → attachments is None.
+        from tests.fixtures import attachment_with_status_block
+
+        html = message_row(
+            "status-1",
+            TS_2024_09_01,
+            content="",
+            attachments_html=attachment_with_status_block(
+                "report.pdf",
+                status="Отклонено",
+            ),
+        )
+        msg = self._task().collect_messages(BeautifulSoup(html, "lxml"))[0]
+        self.assertIsNone(msg.attachments)
+
+    def test_image_attachment_detected_as_none_slot(self) -> None:
+        # Image attachment block (no filename cell) → one None slot in attachments.
+        msg = self._task().collect_messages(
+            BeautifulSoup(IMAGE_ATTACHMENT_HTML, "lxml")
+        )[0]
+        self.assertEqual(msg.attachments, [None])
+
+    def test_image_attachment_makes_message_truthy(self) -> None:
+        # A message with only an image attachment (no text) must be kept
+        # (Message.__bool__ must be True so it survives filter(bool, ...) in write_json).
+        msg = self._task().collect_messages(
+            BeautifulSoup(IMAGE_ATTACHMENT_HTML, "lxml")
+        )[0]
+        self.assertEqual(msg.content, "")
+        self.assertTrue(bool(msg))
+
+    def test_image_attachment_alongside_text(self) -> None:
+        # Image attachment coexists with message text.
+        msg = self._task().collect_messages(
+            BeautifulSoup(IMAGE_WITH_TEXT_HTML, "lxml")
+        )[0]
+        self.assertEqual(msg.content, "See attached")
+        self.assertEqual(msg.attachments, [None])
+
+    def test_file_attachment_not_confused_with_image(self) -> None:
+        # Regular file attachment block (has name/size but no image wrap) → no record.
+        msg = self._task().collect_messages(
+            BeautifulSoup(ATTACHMENT_ONLY_HTML, "lxml")
+        )[0]
+        self.assertIsNone(msg.attachments)
+
+    def test_video_attachment_produces_no_record(self) -> None:
+        msg = self._task().collect_messages(
+            BeautifulSoup(VIDEO_ATTACHMENT_HTML, "lxml")
+        )[0]
+        self.assertIsNone(msg.attachments)
+
+    def test_mixed_image_and_video_blocks_count_image_only(self) -> None:
+        html = message_row(
+            "msg-mixed",
+            TS_2024_09_01,
+            content="pics",
+            attachments_html=image_attachment_block() + video_attachment_block(),
+        )
+        msg = self._task().collect_messages(BeautifulSoup(html, "lxml"))[0]
+        self.assertEqual(msg.attachments, [None])
+
+    def test_collect_thread_reply_entries_forwards_quotes(self) -> None:
+        # Thread reply with a quote → quotes field is populated on Entry.
+        panel_html = f"""
+<div class="{THREAD_PANEL_CLS}">
+  <div class="{MSG_LIST_CONTAINER_CLS}">
+{message_row("root-q", TS_2024_09_01, sender_name="Alice", content="Root")}
+{message_row("reply-q", TS_2024_09_01, sender_name="Bob", content="Agreed",
+             quotes_html=quote_block("Alice", "Earlier message"))}
+  </div>
+</div>
+"""
+        soup = BeautifulSoup(panel_html, "lxml")
+        entries = self._task().collect_thread_reply_entries(soup, "root-q")
+        self.assertEqual(len(entries), 1)
+        reply = entries[0]
+        self.assertEqual(reply.message_id, "reply-q")
+        self.assertIsNotNone(reply.quotes)
+        self.assertEqual(len(reply.quotes), 1)
+        self.assertEqual(reply.quotes[0].sender_name, "Alice")
+
+    def test_collect_thread_reply_entries_no_quotes_is_none(self) -> None:
+        # Thread reply without quotes → quotes field is None (not empty list).
+        soup = BeautifulSoup(THREAD_PANEL_SAMPLE_HTML, "lxml")
+        entries = self._task().collect_thread_reply_entries(soup, "msg-root")
+        for reply in entries:
+            self.assertIsNone(reply.quotes)
+
+    def test_message_id_pipe_normalized_to_underscore(self) -> None:
+        # data-message-id with | → _ at parse time (filesystem-safe filename prefix).
+        from pageup.config import MSG_WRAP_CLS
+
+        content_cls = "BlockMessageStyleComponent-BlockMessageText__cls1"
+        html = f"""
+<div class="{MSG_WRAP_CLS}"
+     data-message-id="1553797810759471601|-857953021546601497"
+     data-message-date="{TS_2024_09_01}">
+  <span class="{content_cls}">hello</span>
+</div>"""
+        msg = self._task().collect_messages(BeautifulSoup(html, "lxml"))[0]
+        self.assertEqual(msg.message_id, "1553797810759471601_-857953021546601497")
+        self.assertNotIn("|", msg.message_id)
 
     def _make_message(self, message_id: str, content: str, date_ms: int) -> Message:
         # Build minimal HTML and parse through the real collect_messages path.
@@ -435,16 +804,62 @@ class ParsingTaskTests(unittest.TestCase):
         return self._task().collect_messages(BeautifulSoup(html, "lxml"))[0]
 
 
-class QuoteAndAttachmentModelTests(unittest.TestCase):
-    """Smoke tests for nested Pydantic models used inside Message."""
+class EntryAndQuoteModelTests(unittest.TestCase):
+    """Smoke tests for Quote and Entry Pydantic models."""
 
     def test_quote_model(self) -> None:
         q = Quote(sender_name="Bob", content="text")
         self.assertEqual(q.sender_name, "Bob")
 
-    def test_attachment_optional_size(self) -> None:
-        a = Attachment(name="file.bin", size=None)
-        self.assertIsNone(a.size)
+    def test_entry_field_serializer_strips_none_slots(self) -> None:
+        # @field_serializer("attachments") filters None placeholders before JSON output.
+        entry = Entry(
+            message_id="e1",
+            date=datetime(2025, 1, 1, tzinfo=moscow_timezone),
+            sender_url=None,
+            sender_name="Alice",
+            content="hi",
+            attachments=[None, "file_0.png", None, "file_2.jpg"],
+        )
+        serialized = entry.model_dump()
+        self.assertEqual(serialized["attachments"], ["file_0.png", "file_2.jpg"])
+
+    def test_entry_field_serializer_strips_empty_string_slots(self) -> None:
+        # Skipped video placeholders ("") must not appear in JSON output.
+        entry = Entry(
+            message_id="e1b",
+            date=datetime(2025, 1, 1, tzinfo=moscow_timezone),
+            sender_url=None,
+            sender_name="Alice",
+            content="hi",
+            attachments=["file_0.png", ""],
+        )
+        serialized = entry.model_dump()
+        self.assertEqual(serialized["attachments"], ["file_0.png"])
+
+    def test_entry_field_serializer_all_none_returns_none(self) -> None:
+        # When all slots are None (all pending), serialized attachments is None.
+        entry = Entry(
+            message_id="e2",
+            date=datetime(2025, 1, 1, tzinfo=moscow_timezone),
+            sender_url=None,
+            sender_name="Alice",
+            content="hi",
+            attachments=[None, None],
+        )
+        serialized = entry.model_dump()
+        self.assertIsNone(serialized["attachments"])
+
+    def test_entry_includes_message_id(self) -> None:
+        # message_id must appear in the serialized Entry (needed for JSON output).
+        entry = Entry(
+            message_id="xyz",
+            date=datetime(2025, 1, 1, tzinfo=moscow_timezone),
+            sender_url=None,
+            sender_name=None,
+            content="text",
+        )
+        self.assertEqual(entry.model_dump()["message_id"], "xyz")
 
 
 if __name__ == "__main__":

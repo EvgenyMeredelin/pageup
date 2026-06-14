@@ -15,6 +15,8 @@ This module provides:
 * **Small pure functions** used inside the pipeline and quote normalisation.
 * **Constants** shared across modules: the Moscow timezone object and the
   compiled group-URL pattern.
+* **``normalize_message_id`` / ``dom_message_id``** — convert between DOM
+  ``data-message-id`` (``|`` separator) and filesystem-safe JSON form (``_``).
 
 Used by:
     models.py — cleaner on every get_text(); finalize_quote_content on quotes;
@@ -51,6 +53,25 @@ _time_prefix_pattern: re.Pattern[str] = re.compile(r"\d\d:\d\d(.+)", re.DOTALL)
 # All message timestamps are converted to this zone for output and comparison.
 # tzdata package ensures this works on minimal Linux images without system tz DB.
 moscow_timezone: ZoneInfo = ZoneInfo("Europe/Moscow")
+
+
+def normalize_message_id(raw_id: str) -> str:
+    """Normalize a DOM ``data-message-id`` for JSON output and filenames.
+
+    SberChat ids join two numeric segments with ``|``; only that character is
+    replaced with ``_`` for filesystem safety.  Hyphens in the second segment
+    are kept unchanged.
+    """
+    return raw_id.replace("|", "_")
+
+
+def dom_message_id(normalized_id: str) -> str:
+    """Convert a normalized id back to the DOM ``data-message-id`` form.
+
+    Used by Selenium selectors — the live DOM keeps the original ``|`` separator.
+    Safe because SberChat ids never contain ``_`` before normalization.
+    """
+    return normalized_id.replace("_", "|")
 
 
 # ── Text-normalisation helpers ────────────────────────────────────────────────

@@ -20,12 +20,19 @@ Key scenarios:
     Non-terminal extend excludes rows before min_date (DOM order != chronology)
     Stall progress logging mirrors empty-scroll progress logging
     Stall does not inflate collected-so-far or Messages collected counts
+    ThreadRetryExtendTests verifies thread retry for already-collected rows
+    enrich_fresh_threads and prepare_main_feed_scroll are patched in setUp
+    (thread Selenium workflow tested separately in test_threads.py;
+    PrepareBeforeScrollTests verifies prepare is invoked before PAGE_UP,
+    including on the empty-DOM scroll branch)
 """
 
 import re
 import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, PropertyMock, patch
+
+from bs4 import BeautifulSoup
 
 from selenium.common.exceptions import TimeoutException
 
@@ -78,6 +85,9 @@ class CreateDriverTests(unittest.TestCase):
         self.assertEqual(kwargs["service"], mock_service.return_value)
         mock_service.assert_called_once_with(SBERBROWSER_DRIVER)
         mock_chrome.return_value.set_page_load_timeout.assert_not_called()
+        mock_chrome.return_value.execute_cdp_cmd.assert_called_once_with(
+            "Page.setDownloadBehavior", {"behavior": "deny"}
+        )
 
     @patch("pageup.runner.Chrome")
     @patch("pageup.runner.Service")
@@ -97,10 +107,29 @@ class CreateDriverTests(unittest.TestCase):
         mock_chrome.return_value.set_page_load_timeout.assert_called_once_with(
             PAGE_LOAD_TIMEOUT_SEC
         )
+        mock_chrome.return_value.execute_cdp_cmd.assert_called_once_with(
+            "Page.setDownloadBehavior", {"behavior": "deny"}
+        )
 
 
 class RunTests(unittest.TestCase):
     """Scroll loop behaviour with mocked driver and shortened sleep_time."""
+
+    def setUp(self) -> None:
+        # Thread enrichment requires live Selenium — pass through in unit tests.
+        self._enrich_patcher = patch(
+            "pageup.runner.enrich_fresh_threads",
+            side_effect=lambda driver, task, fresh, thread_collected_ids, thread_open_attempts=None, write_dir=None: fresh,
+        )
+        self._enrich_patcher.start()
+        # prepare_main_feed_scroll uses real WebDriverWait; MagicMock drivers
+        # appear to have an open panel forever → 10 s timeouts per scroll step.
+        self._prepare_patcher = patch("pageup.runner.prepare_main_feed_scroll")
+        self._prepare_patcher.start()
+
+    def tearDown(self) -> None:
+        self._prepare_patcher.stop()
+        self._enrich_patcher.stop()
 
     # page_source is a property on WebDriver — PropertyMock side_effect yields
     # different HTML on each loop iteration without a real browser.
@@ -702,6 +731,189 @@ class RunTests(unittest.TestCase):
         mock_write.assert_called_once()
         messages = mock_write.call_args.args[0]
         self.assertEqual(messages, [])
+
+
+class PrepareBeforeScrollTests(unittest.TestCase):
+    """Runner invokes prepare_main_feed_scroll before main PAGE_UP (not patched in RunTests)."""
+
+    @patch("builtins.print")
+    @patch("pageup.runner.ActionChains")
+    @patch("pageup.runner.time.sleep")
+    @patch("pageup.runner.create_driver")
+    @patch(
+        "pageup.runner.enrich_fresh_threads",
+        side_effect=lambda driver, task, fresh, thread_collected_ids, thread_open_attempts=None, write_dir=None: fresh,
+    )
+    @patch("pageup.runner.prepare_main_feed_scroll")
+    def test_prepare_called_before_scroll(
+        self,
+        mock_prepare,
+        _mock_enrich,
+        mock_create,
+        mock_sleep,
+        mock_actions_cls,
+        _mock_print,
+    ) -> None:
+        mock_driver = MagicMock()
+        mock_create.return_value = mock_driver
+        mock_actions_cls.return_value = MagicMock()
+
+        new_only = message_row("msg-new", TS_2024_09_01, content="new")
+        old_html = message_row("msg-old", TS_2024_01_15, content="too old")
+        type(mock_driver).page_source = PropertyMock(
+            side_effect=[new_only, old_html]
+        )
+
+        task = ParsingTask(
+            name="preparetest",
+            group_url=GROUP_URL,
+            min_date=datetime(2024, 6, 1, tzinfo=moscow_timezone),
+        )
+
+        with patch.object(ParsingTask, "write_json"):
+            run(
+                task,
+                trusted_device=False,
+                sleep_time=1,
+                write_dir="/tmp/preparetest-out",
+            )
+
+        mock_prepare.assert_called()
+        mock_prepare.assert_called_with(mock_driver)
+
+    @patch("builtins.print")
+    @patch("pageup.runner.ActionChains")
+    @patch("pageup.runner.time.sleep")
+    @patch("pageup.runner.create_driver")
+    @patch(
+        "pageup.runner.enrich_fresh_threads",
+        side_effect=lambda driver, task, fresh, thread_collected_ids, thread_open_attempts=None, write_dir=None: fresh,
+    )
+    @patch("pageup.runner.prepare_main_feed_scroll")
+    def test_prepare_called_on_empty_dom_scroll(
+        self,
+        mock_prepare,
+        _mock_enrich,
+        mock_create,
+        mock_sleep,
+        mock_actions_cls,
+        _mock_print,
+    ) -> None:
+        mock_driver = MagicMock()
+        mock_create.return_value = mock_driver
+        mock_actions_cls.return_value = MagicMock()
+
+        empty_html = "<html><body></body></html>"
+        old_html = message_row("msg-old", TS_2024_01_15, content="too old")
+        type(mock_driver).page_source = PropertyMock(
+            side_effect=[empty_html, old_html]
+        )
+
+        task = ParsingTask(
+            name="prepareempty",
+            group_url=GROUP_URL,
+            min_date=datetime(2024, 6, 1, tzinfo=moscow_timezone),
+        )
+
+        with patch.object(ParsingTask, "write_json"):
+            run(
+                task,
+                trusted_device=False,
+                sleep_time=1,
+                write_dir="/tmp/prepareempty-out",
+            )
+
+        mock_prepare.assert_called()
+        mock_prepare.assert_called_with(mock_driver)
+
+
+class ThreadRetryExtendTests(unittest.TestCase):
+    """Runner re-opens thread bubbles for already-collected messages when needed."""
+
+    @patch("builtins.print")
+    @patch("pageup.runner.ActionChains")
+    @patch("pageup.runner.time.sleep")
+    @patch("pageup.runner.create_driver")
+    @patch("pageup.runner.prepare_main_feed_scroll")
+    def test_retries_thread_for_already_collected_message(
+        self,
+        mock_prepare,
+        mock_create,
+        mock_sleep,
+        mock_actions_cls,
+        _mock_print,
+    ) -> None:
+        threaded_html = message_row(
+            "parent-1",
+            TS_2024_09_01,
+            content="Question",
+            thread_html=(
+                '<div class="MessageThreadPanel-MessageThreadPanelWrapper__cls1">'
+                '<span class="MessageThreadPanel-MessageThreadPanelTitle__cls1">'
+                "1 ответ</span></div>"
+            ),
+        )
+        old_html = message_row("msg-old", TS_2024_01_15, content="too old")
+        mock_driver = MagicMock()
+        mock_create.return_value = mock_driver
+        mock_actions_cls.return_value = MagicMock()
+        type(mock_driver).page_source = PropertyMock(
+            side_effect=[threaded_html, threaded_html, old_html]
+        )
+
+        def enrich(
+            driver,
+            task,
+            fresh,
+            thread_collected_ids,
+            thread_open_attempts=None,
+            write_dir=None,
+        ):
+            from pageup.models import Entry
+
+            attempts = thread_open_attempts if thread_open_attempts is not None else {}
+            if attempts.get("parent-1", 0) >= 1:
+                return [
+                    fresh[0].model_copy(
+                        update={
+                            "thread_replies": [
+                                Entry(
+                                    message_id="reply-1",
+                                    date=datetime(
+                                        2024, 9, 1, 12, 0, tzinfo=moscow_timezone
+                                    ),
+                                    sender_url=None,
+                                    sender_name="Bob",
+                                    attachments=None,
+                                    content="Answer",
+                                )
+                            ]
+                        }
+                    )
+                ]
+            if thread_open_attempts is not None:
+                thread_open_attempts["parent-1"] = attempts.get("parent-1", 0) + 1
+            return fresh
+
+        task = ParsingTask(
+            name="retrytest",
+            group_url=GROUP_URL,
+            min_date=datetime(2024, 6, 1, tzinfo=moscow_timezone),
+        )
+
+        with patch("pageup.runner.enrich_fresh_threads", side_effect=enrich):
+            with patch.object(ParsingTask, "write_json") as mock_write:
+                run(
+                    task,
+                    trusted_device=False,
+                    sleep_time=1,
+                    write_dir="/tmp/retrytest-out",
+                )
+
+        messages = mock_write.call_args.args[0]
+        self.assertEqual(len(messages), 1)
+        self.assertIsNotNone(messages[0].thread_replies)
+
 
 
 if __name__ == "__main__":

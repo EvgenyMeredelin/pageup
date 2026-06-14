@@ -265,22 +265,23 @@ class CliTests(unittest.TestCase):
     def test_success_invokes_run_with_parsed_task(self, mock_run) -> None:
         # Patch at cli boundary so Typer wiring is tested without mocking runner internals.
         # --personal-device sets trusted_device=False (Yandex Browser + YandexDriver).
-        result = self.runner.invoke(
-            app,
-            [
-                "--name",
-                "SberOS",
-                "--group-url",
-                GROUP_URL,
-                "--min-date",
-                "20250901",
-                "--personal-device",
-                "--sleep-time",
-                "1",
-                "--write-dir",
-                "/tmp/out",
-            ],
-        )
+        with patch("pageup.cli._now_msk", return_value="2026-06-14T18-14-00"):
+            result = self.runner.invoke(
+                app,
+                [
+                    "--name",
+                    "SberOS",
+                    "--group-url",
+                    GROUP_URL,
+                    "--min-date",
+                    "20250901",
+                    "--personal-device",
+                    "--sleep-time",
+                    "1",
+                    "--write-dir",
+                    "/tmp/out",
+                ],
+            )
         self.assertEqual(result.exit_code, 0)
         mock_run.assert_called_once()
         task = mock_run.call_args.args[0]
@@ -292,7 +293,7 @@ class CliTests(unittest.TestCase):
         kwargs = mock_run.call_args.kwargs
         self.assertFalse(kwargs["trusted_device"])
         self.assertEqual(kwargs["sleep_time"], 1)
-        self.assertEqual(kwargs["write_dir"], "/tmp/out")
+        self.assertEqual(kwargs["write_dir"], "/tmp/out/2026-06-14T18-14-00")
 
     @patch("pageup.cli.run")
     def test_explicit_trusted_device_flag(self, mock_run) -> None:
@@ -330,38 +331,44 @@ class CliTests(unittest.TestCase):
 
     @patch("pageup.cli.run")
     def test_default_write_dir_expanded(self, mock_run) -> None:
-        result = self.runner.invoke(
-            app,
-            [
-                "--name",
-                "SberOS",
-                "--group-url",
-                GROUP_URL,
-                "--min-date",
-                "20250901",
-            ],
-        )
+        with patch("pageup.cli._now_msk", return_value="2026-06-14T18-14-00"):
+            result = self.runner.invoke(
+                app,
+                [
+                    "--name",
+                    "SberOS",
+                    "--group-url",
+                    GROUP_URL,
+                    "--min-date",
+                    "20250901",
+                ],
+            )
         self.assertEqual(result.exit_code, 0)
-        expected = str(Path("~/projects/pageup-results").expanduser())
+        expected = str(
+            Path("~/projects/pageup-results").expanduser() / "2026-06-14T18-14-00"
+        )
         self.assertEqual(mock_run.call_args.kwargs["write_dir"], expected)
 
     @patch("pageup.cli.run")
     def test_explicit_tilde_write_dir_expanded(self, mock_run) -> None:
-        result = self.runner.invoke(
-            app,
-            [
-                "--name",
-                "SberOS",
-                "--group-url",
-                GROUP_URL,
-                "--min-date",
-                "20250901",
-                "--write-dir",
-                "~/tmp/out",
-            ],
-        )
+        with patch("pageup.cli._now_msk", return_value="2026-06-14T18-14-00"):
+            result = self.runner.invoke(
+                app,
+                [
+                    "--name",
+                    "SberOS",
+                    "--group-url",
+                    GROUP_URL,
+                    "--min-date",
+                    "20250901",
+                    "--write-dir",
+                    "~/tmp/out",
+                ],
+            )
         self.assertEqual(result.exit_code, 0)
-        expected = str(Path("~/tmp/out").expanduser())
+        expected = str(
+            Path("~/tmp/out").expanduser() / "2026-06-14T18-14-00"
+        )
         self.assertEqual(mock_run.call_args.kwargs["write_dir"], expected)
 
 

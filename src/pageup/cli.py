@@ -2,13 +2,22 @@
 
 This module defines the ``pageup`` CLI command that is installed as a
 console entry point by ``pyproject.toml``.  It is the primary user-facing
-surface of the package; successful runs write ``{write-dir}/{name}.json``.
+surface of the package; successful runs write output under
+``{write-dir}/{timestamp_MSK}/`` where ``timestamp_MSK`` is the Moscow-time
+wall clock at invocation (format ``YYYY-MM-DDTHH-MM-SS``):
+
+* ``{write-dir}/{timestamp_MSK}/{name}.json`` — collected messages
+* ``{write-dir}/{timestamp_MSK}/attachments/{file}.{ext}`` — downloaded images
 
 Execution flow (``main()``):
 
 1. Parse ``--min-date`` from YYYYMMDD and attach ``moscow_timezone``.
 2. Build a ``ParsingTask`` (Pydantic validates ``name`` and ``group_url``).
-3. Call ``runner.run()`` with device mode, setup countdown, and output directory.
+3. Generate a Moscow-time ``timestamp_MSK`` string and build the run output dir.
+4. Call ``runner.run()`` — scroll loop, ``threads.enrich_fresh_threads`` for
+   uncollected discussion-panel replies, and ``threads.prepare_main_feed_scroll``
+   (close panel, refocus main feed) before each main ``PAGE_UP`` — with device
+   mode, setup countdown, and output directory.
 
 ``--trusted-device`` selects Sberbrowser + sberdriver on Sigma
 (``config.SBERBROWSER_BINARY``, ``config.SBERBROWSER_DRIVER``).
@@ -62,10 +71,20 @@ from pageup.tools import moscow_timezone
 
 app = typer.Typer(
     name="pageup",
-    help="Collect SberChat group messages and write them to a JSON file.",
+    help="Collect SberChat group messages, thread replies, and write JSON.",
     # Show default values in --help output.
     context_settings={"show_default": True},
 )
+
+
+def _now_msk() -> str:
+    """Return the current Moscow time as a filesystem-safe string.
+
+    Format: ``YYYY-MM-DDTHH-MM-SS`` (colons replaced by dashes so the string
+    is safe on all filesystems).  Called once per invocation to generate the
+    run-specific subdirectory name inside ``--write-dir``.
+    """
+    return datetime.now(tz=moscow_timezone).strftime("%Y-%m-%dT%H-%M-%S")
 
 
 def _version_callback(value: bool) -> None:
@@ -86,10 +105,10 @@ def main(
         typer.Option(
             "--name", "-n",
             help=(
-                "Output file {write-dir}/{name}.json (e.g. --name \"AI in Dev Community\" → "
-                "~/projects/pageup-results/AI in Dev Community.json).  Plain filename only — no `/` or `\\`, "
-                "not `.` or `..`, no null bytes, not empty or whitespace-only; "
-                "leading/trailing spaces are stripped."
+                "Chat name used as the output filename (e.g. --name \"AI in Dev Community\" → "
+                "pageup-results/2026-06-14T18-14-00/AI in Dev Community.json).  "
+                "Plain filename only — no `/` or `\\`, not `.` or `..`, no null bytes, "
+                "not empty or whitespace-only; leading/trailing spaces are stripped."
             ),
         ),
     ],
@@ -113,8 +132,8 @@ def main(
                 "(e.g. 20250901 for 1 September 2025).  Interpreted as midnight "
                 "Moscow time on that calendar day; messages from the full day are "
                 "included.  Collection stops when any of these occur: the oldest "
-                "visible message predates this cutoff; ~60 s of scrolling with no "
-                "parseable message rows; or ~60 s of scrolling with no new "
+                "visible message predates this cutoff; ~30 s of scrolling with no "
+                "parseable message rows; or ~4 s of scrolling with no new "
                 "message IDs while history cannot reach this date."
             ),
         ),
@@ -153,7 +172,11 @@ def main(
         str,
         typer.Option(
             "--write-dir",
-            help="Directory in which to write the output JSON file.  Created if missing.",
+            help=(
+                "Base output directory.  Each run creates a Moscow-timestamped "
+                "subdirectory inside it: {write-dir}/YYYY-MM-DDTHH-MM-SS/.  "
+                "Created automatically if missing."
+            ),
         ),
     ] = "~/projects/pageup-results",
     # ── Meta ──────────────────────────────────────────────────────────────────
@@ -167,7 +190,7 @@ def main(
         ),
     ] = False,
 ) -> None:
-    """Collect SberChat group messages and write them to a JSON file."""
+    """Collect SberChat group messages, thread replies, and write JSON."""
 
     # ── Parse min_date from YYYYMMDD string ───────────────────────────────────
     # strptime validates calendar shape only; timezone is applied below.
@@ -203,9 +226,12 @@ def main(
     # Typer invokes main() when the installed `pageup` console script runs,
     # or when `python3 -m pageup` loads pageup.__main__ (Sigma deploy).
     # expanduser() so ~/… defaults and CLI paths resolve before mkdir/write.
+    # _now_msk() generates a per-invocation Moscow timestamp used as the run
+    # subdirectory: {write_dir}/{timestamp_MSK}/.
+    run_dir = str(Path(write_dir).expanduser() / _now_msk())
     run(
         task,
         trusted_device=trusted_device,
         sleep_time=sleep_time,
-        write_dir=str(Path(write_dir).expanduser()),
+        write_dir=run_dir,
     )

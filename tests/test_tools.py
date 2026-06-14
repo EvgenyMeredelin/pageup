@@ -9,9 +9,11 @@ import unittest
 
 from pageup.tools import (
     cleaner,
+    dom_message_id,
     finalize_quote_content,
     group_url_pattern,
     moscow_timezone,
+    normalize_message_id,
     Pipeline,
     remove_emoji,
     remove_redundant_whitespaces,
@@ -126,6 +128,33 @@ class ConstantsTests(unittest.TestCase):
 
     def test_moscow_timezone_name(self) -> None:
         self.assertEqual(moscow_timezone.key, "Europe/Moscow")
+
+
+class MessageIdNormalizationTests(unittest.TestCase):
+    """normalize_message_id / dom_message_id round-trip for Selenium vs JSON."""
+
+    def test_pipe_becomes_underscore(self) -> None:
+        raw = "5621764540321829361|5243477299780701419"
+        normalized = normalize_message_id(raw)
+        self.assertEqual(normalized, "5621764540321829361_5243477299780701419")
+        self.assertEqual(dom_message_id(normalized), raw)
+
+    def test_hyphen_in_second_segment_preserved(self) -> None:
+        raw = "1553797810759471601|-857953021546601497"
+        normalized = normalize_message_id(raw)
+        self.assertEqual(normalized, "1553797810759471601_-857953021546601497")
+        self.assertEqual(dom_message_id(normalized), raw)
+
+
+class RowSelectorTests(unittest.TestCase):
+    def test_row_selector_uses_dom_pipe_form(self) -> None:
+        from pageup.threads import _row_selector
+
+        normalized = "5621764540321829361_5243477299780701419"
+        self.assertIn(
+            'data-message-id="5621764540321829361|5243477299780701419"',
+            _row_selector(normalized),
+        )
 
 
 if __name__ == "__main__":

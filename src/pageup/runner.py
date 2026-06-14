@@ -21,16 +21,21 @@ scrolls upward.  Each iteration:
 
 1. Captures the current ``driver.page_source`` (the full rendered DOM).
 2. Parses it with BeautifulSoup (lxml backend for speed).
-3. Extracts all visible message rows.
-4. Scrolls up by 20 page-heights via ``ActionChains`` + ``Keys.PAGE_UP``.
-5. Sleeps 1 second to allow React to render the newly loaded messages.
+3. Extracts all visible message rows; for uncollected rows with a green thread
+   bubble, opens the discussion panel, scrolls inner history via JavaScript
+   ``scrollTop``, and attaches ``thread_replies``.
+4. Ensures the discussion panel is closed and the main feed has focus
+   (``threads.prepare_main_feed_scroll``).
+5. Scrolls up by 20 page-heights via ``ActionChains`` + ``Keys.PAGE_UP``.
+6. Sleeps ``MAIN_SCROLL_SLEEP_SEC`` (0.5 s default) to allow React to render
+   the newly loaded messages.
 
 The loop terminates when:
 
 * the oldest visible message predates ``min_date`` (``ParsingTask.is_done``);
-* no message rows appear for ``MAX_EMPTY_SCROLL_ATTEMPTS`` iterations (~60 s);
+* no message rows appear for ``MAX_EMPTY_SCROLL_ATTEMPTS`` iterations (~30 s);
 * no new ``message_id`` values appear for ``MAX_STALL_SCROLL_ATTEMPTS``
-  iterations (~60 s) while rows are still visible;
+  iterations (~4 s) while rows are still visible;
 * the operator raises ``KeyboardInterrupt`` (partial or empty output is still
   written);
 * an unexpected error is raised during the run (partial output is written,
@@ -57,6 +62,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 
 from pageup.config import (
+    MAIN_SCROLL_SLEEP_SEC,
     MAX_EMPTY_SCROLL_ATTEMPTS,
     MAX_STALL_SCROLL_ATTEMPTS,
     PAGE_LOAD_TIMEOUT_SEC,
@@ -68,10 +74,16 @@ from pageup.config import (
     YANDEX_DRIVER,
 )
 from pageup.models import Message, ParsingTask
+from pageup.threads import download_fresh_images, enrich_fresh_threads, prepare_main_feed_scroll
 
 # Browser binaries: Sberbrowser + sberdriver (trusted), Yandex Browser +
 # YandexDriver (personal).  Scroll limits MAX_EMPTY_SCROLL_ATTEMPTS and
-# MAX_STALL_SCROLL_ATTEMPTS in runner.run().
+# MAX_STALL_SCROLL_ATTEMPTS in runner.run(); thread inner scroll uses
+# MAX_THREAD_STALL_ATTEMPTS / MAX_THREAD_BOOTSTRAP_DOWN_STEPS in
+# threads._collect_thread_panel_replies() (JS scrollTop per inner step);
+# MAX_THREAD_OPEN_ATTEMPTS caps per-message bubble retries; extend_fresh_with_threads
+# can re-enqueue already-collected rows for pending threads; prepare_main_feed_scroll()
+# closes the panel and focuses the main feed before each PAGE_UP (see threads.py).
 
 _SETUP_HINT = "scroll to latest message, click inside chat"
 
@@ -97,6 +109,9 @@ def create_driver(*, trusted_device: bool) -> Chrome:
     Trusted Sigma mode: no ``page_load_strategy``, no ``set_page_load_timeout``
     — ``driver.get()`` blocks until navigation and cert/OTP finish.
     Personal mode uses ``eager`` plus ``PAGE_LOAD_TIMEOUT_SEC``.
+
+    Both modes call ``Page.setDownloadBehavior: deny`` so accidental gallery
+    «Скачать» clicks cannot fill ``~/Downloads``.
     """
     if trusted_device:
         # Exact 83b9d71 Sigma driver options — do not add extra Chromium flags
@@ -119,6 +134,11 @@ def create_driver(*, trusted_device: bool) -> Chrome:
         driver = Chrome(options=options, service=service)
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SEC)
 
+    try:
+        driver.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "deny"})
+    except WebDriverException:
+        pass
+
     return driver
 
 
@@ -135,7 +155,8 @@ def run(
     and OTP if prompted), runs a setup countdown (*sleep_time*) for the
     operator to scroll to the most recent message and focus the chat, then
     scrolls upward collecting messages until the target date is reached,
-    a scroll safety limit fires (~60 s with no rows or no new message IDs),
+    a scroll safety limit fires (~30 s with no rows, or ~4 s with no new
+    message IDs),
     or a ``KeyboardInterrupt`` or unexpected error is raised (partial or empty
     output is still written).
 
@@ -199,8 +220,8 @@ def run(
             _log("Task parameters:")
             print(task.model_dump_json(ensure_ascii=False, indent=4), flush=True)
 
-            # Batches are newest-first per collect_messages(); extend_fresh dedupes
-            # truthy in-range rows on extend; write_json orders chronologically.
+            # Batches are newest-first per collect_messages(); extend_fresh_with_threads
+            # merges new in-range rows and pending thread retries; write_json orders chronologically.
 
             # ── Phase 2: setup countdown (operator scrolls to latest message) ───
             # Cert/OTP often finish during navigation; this window is for scroll
@@ -215,23 +236,62 @@ def run(
             # Termination order inside each iteration (non-empty branch):
             #   1. is_done on oldest visible row — normal completion
             #   2. stall guard — history exhausted or min_date unreachable
-            #   3. extend_fresh (deduped, in-range, truthy rows) and scroll up
+            #   3. extend_fresh_with_threads (new in-range rows plus thread retries,
+            #      in-place merge when a pending bubble succeeds),
+            #      prepare_main_feed_scroll, and scroll up
             # seen_ids tracks visible message_id for stall detection; collected_ids
-            # tracks unique truthy in-range IDs appended to messages.
+            # tracks unique in-range IDs stored in messages; thread_collected_ids
+            # and thread_open_attempts gate thread-panel work (see threads.py).
             empty_scroll_attempts = 0
             seen_ids: set[str] = set()
             collected_ids: set[str] = set()
+            thread_collected_ids: set[str] = set()
+            thread_open_attempts: dict[str, int] = {}
             stall_attempts = 0
             scroll_iteration = 0
 
-            def extend_fresh(batch: list[Message]) -> None:
-                fresh = [
-                    m for m in batch
-                    if m and not task.is_done(m) and m.message_id not in collected_ids
-                ]
-                if fresh:
-                    collected_ids.update(m.message_id for m in fresh)
-                    messages.extend(fresh)
+            def extend_fresh_with_threads(batch: list[Message]) -> None:
+                fresh: list[Message] = []
+                seen_fresh: set[str] = set()
+                for message in batch:
+                    if not message or task.is_done(message):
+                        continue
+                    message_id = message.message_id
+                    if message_id in seen_fresh:
+                        continue
+                    seen_fresh.add(message_id)
+                    thread_pending = (
+                        message.thread_reply_count
+                        and message.thread_reply_count > 0
+                        and message_id not in thread_collected_ids
+                    )
+                    if message_id not in collected_ids or thread_pending:
+                        fresh.append(message)
+                if not fresh:
+                    return
+                enriched = enrich_fresh_threads(
+                    driver,
+                    task,
+                    fresh,
+                    thread_collected_ids=thread_collected_ids,
+                    thread_open_attempts=thread_open_attempts,
+                    write_dir=write_dir,
+                )
+                enriched = download_fresh_images(driver, write_dir, enriched)
+                for message in enriched:
+                    message_id = message.message_id
+                    for index, existing in enumerate(messages):
+                        if existing.message_id == message_id:
+                            message = ParsingTask.prefer_richer_message(
+                                existing, message
+                            )
+                            messages[index] = message
+                            break
+                    else:
+                        messages.append(message)
+                    collected_ids.add(message_id)
+                    if ParsingTask.thread_is_complete(message):
+                        thread_collected_ids.add(message_id)
 
             while True:
                 scroll_iteration += 1
@@ -254,17 +314,18 @@ def run(
                             f"{_SETUP_HINT}"
                         )
                     if empty_scroll_attempts >= MAX_EMPTY_SCROLL_ATTEMPTS:
-                        # config.MAX_EMPTY_SCROLL_ATTEMPTS caps idle scrolling (60 s).
+                        # config.MAX_EMPTY_SCROLL_ATTEMPTS caps idle scrolling (~30 s).
                         _log(
                             "Warning: no messages found after repeated scrolling; "
                             "stopping."
                         )
                         _finish(task, messages, write_dir)
                         break
+                    prepare_main_feed_scroll(driver)
                     actions.send_keys(Keys.PAGE_UP * 20)
                     actions.perform()
                     # Allow React to render newly loaded rows before re-parsing.
-                    time.sleep(1)
+                    time.sleep(MAIN_SCROLL_SLEEP_SEC)
                     # Empty branch does not reset stall_attempts — the two guards
                     # are independent (see config.MAX_STALL_SCROLL_ATTEMPTS).
                     continue
@@ -279,7 +340,7 @@ def run(
                     # only the in-range subset of the current batch (messages
                     # that are at or after min_date) before writing, so that
                     # the final page snapshot is not silently dropped.
-                    extend_fresh(new_messages)
+                    extend_fresh_with_threads(new_messages)
                     _finish(task, messages, write_dir)
                     break
 
@@ -308,10 +369,9 @@ def run(
                         _finish(task, messages, write_dir)
                         break
 
-                # Non-terminal batches: extend_fresh appends only new truthy in-range
-                # rows.  Per-row is_done filter handles DOM order that is not strictly
-                # chronological (see test_run_is_done_takes_precedence).
-                extend_fresh(new_messages)
+                # Non-terminal batches: extend_fresh_with_threads adds new rows or
+                # updates existing ones when a pending thread succeeds.
+                extend_fresh_with_threads(new_messages)
 
                 if scroll_iteration % SCROLL_PROGRESS_INTERVAL == 0:
                     _log(
@@ -321,10 +381,10 @@ def run(
 
                 # Keys.PAGE_UP * 20 sends twenty PAGE_UP events in one batch —
                 # a large upward jump to trigger SberChat's lazy history loading.
+                prepare_main_feed_scroll(driver)
                 actions.send_keys(Keys.PAGE_UP * 20)
                 actions.perform()
-                # Same 1 s pause after each successful parse+scroll iteration.
-                time.sleep(1)
+                time.sleep(MAIN_SCROLL_SLEEP_SEC)
 
         except KeyboardInterrupt:
             # Manual stop during setup, driver launch, navigation, setup countdown, or scroll.
@@ -342,7 +402,11 @@ def run(
             driver.quit()
 
 
-def _finish(task: ParsingTask, messages: list[Message], write_dir: str) -> None:
+def _finish(
+    task: ParsingTask,
+    messages: list[Message],
+    write_dir: str,
+) -> None:
     """Write *messages* to disk and print a summary line.
 
     Called on normal completion, scroll safety abort, empty-DOM abort,
@@ -355,5 +419,9 @@ def _finish(task: ParsingTask, messages: list[Message], write_dir: str) -> None:
     """
     Path(write_dir).mkdir(parents=True, exist_ok=True)
     unique = ParsingTask._unique_reversed(messages)
-    _log(f"Messages collected: {len(unique)}")
+    with_threads = sum(1 for m in unique if m.thread_replies)
+    if with_threads:
+        _log(f"Messages collected: {len(unique)} ({with_threads} with thread replies)")
+    else:
+        _log(f"Messages collected: {len(unique)}")
     task.write_json(messages, write_dir)

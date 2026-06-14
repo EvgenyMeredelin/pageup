@@ -8,7 +8,8 @@ loads for that form.
 
 Execution path:
     python3 -m pageup  →  __main__  →  pageup.cli.app  →  Typer  →  main()
-    main() builds ParsingTask and delegates to runner.run() for Selenium.
+    main() builds ParsingTask and delegates to runner.run() (scroll loop,
+    thread reply enrichment, and main-feed focus via pageup.threads) for Selenium.
 
 On Fedora dev machines the same module works; ``uv sync`` also installs a
 ``.venv/bin/pageup`` console script that calls the same ``app`` object.

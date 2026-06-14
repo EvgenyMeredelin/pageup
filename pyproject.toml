@@ -5,8 +5,8 @@
 # Distribution name and importable package are both "pageup" (see [project.scripts]).
 [project]
 name = "pageup"
-version = "0.1.0"
-description = "Collect SberChat group messages and write them to a JSON file"
+version = "0.2.0"
+description = "Collect SberChat group messages and thread replies, write JSON"
 readme = "README.md"
 # Python 3.13+ is required for the `type` soft-keyword (models.MsgDump) and
 # modern typing features used throughout src/pageup/.
@@ -15,8 +15,8 @@ requires-python = ">=3.13"
 # ── Runtime dependencies ─────────────────────────────────────────────────────
 # Each package maps to a layer in the data path (see pageup.__init__ docstring).
 dependencies = [
-  "lxml>=5.4.0",           # BeautifulSoup parser backend in runner.run() and models
-  "beautifulsoup4>=4.14.3", # DOM parsing for SberChat message rows (models.collect_messages)
+  "lxml>=5.4.0",           # BeautifulSoup parser backend (runner, threads, models)
+  "beautifulsoup4>=4.14.3", # DOM parsing for message rows and thread panels (models)
   "emoji>=2.15.0",          # tools.remove_emoji — strip pictographs from message text
   "pydantic>=2.12.5",       # Message / ParsingTask validation and JSON serialisation
   "selenium>=4.39.0",       # Chrome WebDriver for Sberbrowser and Yandex Browser

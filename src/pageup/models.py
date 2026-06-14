@@ -2,28 +2,34 @@
 
 Hierarchy
 ---------
-``Attachment``
-    A file or media attachment embedded in a message (filename + size).
-
 ``Quote``
     A reply/quote block embedded in a message.  Stores the quoted
     sender's name and cleaned text (duplicate sender prefix removed from
     ``content`` when the DOM repeats it).
 
+``Entry``
+    A SberChat message entry: base class for both main-channel messages
+    and thread replies.  Stores ``message_id``, timestamp, sender,
+    content, quotes, and attachments (downloaded image filenames).
+
 ``Message``
-    A single SberChat message.  Immutable (``frozen=True``), hashable by
-    ``message_id``, and serialisable to the JSON output format via a
-    custom ``model_serializer``.
+    A main-channel SberChat message.  Inherits from ``Entry``.
+    Immutable (``frozen=True``), hashable by ``message_id``, and
+    serialisable to the JSON output format via a custom
+    ``model_serializer``.  Adds ``thread_reply_count`` and
+    ``thread_replies``.
 
 ``ParsingTask``
     Encapsulates the parameters of a collection run (target group, date
     range, output name) together with all DOM-parsing logic.  The
-    ``collect_messages`` method is the primary entry point called from
-    the scroll loop in ``pageup.runner``.
+    ``collect_messages`` and ``collect_thread_reply_entries`` methods are
+    the primary HTML entry points; ``pageup.runner`` and ``pageup.threads``
+    call them during the main scroll loop and thread-panel workflow.
 """
 
 import itertools
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +39,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     ValidationError,
+    field_serializer,
     field_validator,
     model_serializer,
 )
@@ -40,16 +47,20 @@ from pydantic import (
 from pageup.config import (
     # All selectors below are CSS-module class names or compound selectors —
     # edit config.py when SberChat updates its DOM, not this import list.
-    ATTACH_NAME_CLS,
-    ATTACH_SIZE_CLS,
     MSG_ATTACHMENT_CLS,
     MSG_CONTENT_SEL,
+    MSG_IMAGE_WRAP_CLS,
+    MSG_VIDEO_MEDIA_PREFIXES,
+    MSG_LIST_CONTAINER_CLS,
     MSG_SENDER_NAME_CLS,
     MSG_SENDER_URL_SEL,
     MSG_WRAP_CLS,
     QUOTE_CONTENT_SEL,
     QUOTE_SENDER_NAME_CLS,
     QUOTE_WRAP_CLS,
+    THREAD_BUBBLE_CLS,
+    THREAD_BUBBLE_TITLE_CLS,
+    THREAD_PANEL_CLS,
 )
 from pageup.tools import (
     SBERCHAT_BASE_URL,
@@ -58,6 +69,7 @@ from pageup.tools import (
     finalize_quote_content,
     group_url_pattern,
     moscow_timezone,
+    normalize_message_id,
 )
 
 
@@ -66,7 +78,11 @@ from pageup.tools import (
 # Type of the dict produced by Message.rearrange_fields (used before the
 # final JSON serialisation step so that _patch can mutate sender fields).
 # Plain dicts are used here because Message.patch mutates rows in place after dump.
-type MsgDump = dict[str, str | datetime | list | None]
+type MsgDump = dict[str, str | int | datetime | list | None]
+
+# Parsed once: _scope_root returns this when a scope must yield no message rows
+# (thread panel closed, or main feed obscured by an open panel).
+_EMPTY_SCOPE_SOUP = BeautifulSoup("<html></html>", "lxml")
 
 
 def _tag_attr_str(value: str | list[str] | None) -> str | None:
@@ -82,25 +98,6 @@ def _tag_attr_str(value: str | list[str] | None) -> str | None:
         # Multi-valued attributes: take the first entry (e.g. duplicate href).
         return value[0] if value else None
     return value
-
-
-# ── Attachment ────────────────────────────────────────────────────────────────
-
-class Attachment(BaseModel):
-    """A file or media attachment embedded in a SberChat message.
-
-    Attributes
-    ----------
-    name:
-        The original filename as displayed in the chat (e.g. ``report.pdf``).
-    size:
-        Human-readable file size string as shown by SberChat
-        (e.g. ``"17.2 КБ"``).  ``None`` when the size element is absent
-        (rare for inline images).
-    """
-
-    name: str
-    size: str | None
 
 
 # ── Quote ─────────────────────────────────────────────────────────────────────
@@ -123,49 +120,49 @@ class Quote(BaseModel):
     content: str
 
 
-# ── Message ───────────────────────────────────────────────────────────────────
+# ── Entry ─────────────────────────────────────────────────────────────────────
 
-class Message(BaseModel):
-    """A single SberChat message.
+class Entry(BaseModel):
+    """A SberChat message entry (main-channel message or thread reply).
 
-    The model is frozen (immutable) so that instances can be used as dict
-    keys for deduplication via ``dict.fromkeys``.
+    Base class for ``Message``.  Thread replies are also plain ``Entry``
+    instances (``Message`` adds ``thread_reply_count`` and
+    ``thread_replies``).
 
     Attributes
     ----------
     message_id:
         Internal SberChat identifier read from the ``data-message-id``
-        attribute.  Excluded from JSON output; used only for deduplication.
+        attribute (``|`` replaced with ``_`` for filesystem safety).
+        Included in JSON output to correlate with downloaded image filenames.
     date:
-        Message timestamp as a timezone-aware ``datetime`` (Moscow time).
+        Timestamp as a timezone-aware ``datetime`` (Moscow time).
         Parsed from the Unix-millisecond ``data-message-date`` attribute.
     sender_url:
-        Absolute URL of the sender's SberChat profile page.  ``None`` for
-        continuation messages where SberChat omits the author header.
+        Absolute URL of the sender's SberChat profile page, or ``None``
+        for continuation messages (backfilled by
+        ``collect_thread_reply_entries``).
     sender_name:
-        Display name of the sender.  ``None`` for the same continuation
-        messages; backfilled by ``_patch`` during post-processing.
-    quotes:
-        List of reply/quote blocks embedded in this message, or ``None``
-        if there are none.
-    attachments:
-        List of file/media attachments, or ``None`` if there are none.
+        Display name of the sender, or ``None`` for continuation messages.
     content:
-        Cleaned text content of the message.  Empty string when the
-        message carries only attachments with no text.
+        Cleaned text body.  Empty string when the entry carries only
+        attachments or a thread bubble.
+    quotes:
+        Embedded reply/quote blocks, or ``None`` when absent.
+    attachments:
+        Filenames of downloaded image attachments (e.g.
+        ``["1553…_0.png"]``), or ``None`` when absent.  ``None`` slots
+        in the in-memory list represent images pending download;
+        the ``@field_serializer`` strips them before JSON output.
     """
-
-    # frozen=True makes instances hashable and immutable — required for
-    # dict.fromkeys deduplication in ParsingTask._unique_reversed.
-    model_config = ConfigDict(frozen=True)
 
     message_id: str
     date: AwareDatetime
     sender_url: str | None
     sender_name: str | None
-    quotes: list[Quote] | None
-    attachments: list[Attachment] | None
     content: str
+    quotes: list[Quote] | None = None
+    attachments: list[str | None] | None = None
 
     @field_validator("date", mode="before")
     @classmethod
@@ -180,26 +177,90 @@ class Message(BaseModel):
             if value.tzinfo is None:
                 return value.replace(tzinfo=moscow_timezone)
             return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.isdigit() or (
+                stripped.startswith("-") and stripped[1:].isdigit()
+            ):
+                since_epoch = int(stripped) // 1000
+                return datetime.fromtimestamp(since_epoch, tz=moscow_timezone)
+            try:
+                parsed = datetime.fromisoformat(stripped)
+            except ValueError:
+                pass
+            else:
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=moscow_timezone)
+                return parsed
         # SberChat stores timestamps as milliseconds since the Unix epoch.
-        # Use Moscow tz explicitly so parsing is correct regardless of the
-        # host system's local timezone (e.g. UTC on a personal machine).
         since_epoch = int(value) // 1000
         return datetime.fromtimestamp(since_epoch, tz=moscow_timezone)
 
+    @field_serializer("attachments")
+    def serialize_attachments(
+        self, v: list[str | None] | None
+    ) -> list[str] | None:
+        """Strip ``None`` and skipped (``""``) placeholders; return ``None`` when empty."""
+        if not v:
+            return None
+        result = [a for a in v if a]
+        return result if result else None
+
+
+# ── Message ───────────────────────────────────────────────────────────────────
+
+class Message(Entry):
+    """A main-channel SberChat message.
+
+    Inherits ``message_id``, ``date``, ``sender_url``, ``sender_name``,
+    ``content``, ``quotes``, and ``attachments`` from ``Entry``.
+
+    The model is frozen (immutable) so that instances can be used as dict
+    keys for deduplication via ``dict.fromkeys``.
+
+    Attributes
+    ----------
+    thread_reply_count:
+        Reply count from the green thread bubble (e.g. ``3`` for ``"3 ответа"``).
+        ``None`` when the message has no thread bubble.
+    thread_replies:
+        Replies collected from the discussion panel, excluding the root
+        message.  ``None`` when there is no bubble or collection failed.
+
+    Truthiness (``__bool__``): messages with content, pending or downloaded
+    attachments, a thread bubble (``thread_reply_count``), or collected
+    ``thread_replies`` are kept during post-processing.  Skipped video slots
+    (``""``) do not count as attachments; empty rows without any of the above
+    are dropped.
+    """
+
+    # frozen=True makes instances hashable and immutable — required for
+    # dict.fromkeys deduplication in ParsingTask._unique_reversed.
+    # Entry is not frozen so thread-reply attachments can be mutated in place
+    # during image download.
+    model_config = ConfigDict(frozen=True)
+
+    thread_reply_count: int | None = None
+    thread_replies: list[Entry] | None = None
+
     @model_serializer(when_used="always")
     def rearrange_fields(self) -> MsgDump:
-        """Serialise to a dict with a human-friendly field order.
-
-        ``message_id`` is intentionally excluded — it is an internal
-        deduplication key, not meaningful to downstream consumers.
-        """
+        """Serialise to a dict with a human-friendly field order."""
+        atts = self.attachments
         return {
+            "message_id": self.message_id,
             "date": self.date,
             "sender_url": self.sender_url,
             "sender_name": self.sender_name,
-            "quotes": self.quotes,
-            "attachments": self.attachments,
             "content": self.content,
+            "thread_reply_count": self.thread_reply_count,
+            "thread_replies": self.thread_replies,
+            "quotes": self.quotes,
+            "attachments": (
+                ([a for a in atts if a] or None)
+                if atts
+                else None
+            ),
         }
 
     def __hash__(self) -> int:
@@ -213,13 +274,22 @@ class Message(BaseModel):
         return self.message_id == other.message_id
 
     def __bool__(self) -> bool:
-        """A message is truthy when it has text content or file attachments.
+        """A message is truthy when it has content, attachments, or thread data.
 
-        Textless, attachment-free messages (rare artefacts that can appear
-        when SberChat renders reaction-only or system rows) are falsy and
-        will be filtered out during post-processing.
+        Pending image slots (``None``) count as attachments; skipped video
+        placeholders (``""``) do not.  Textless, attachment-free rows without a
+        thread bubble or collected replies (rare reaction-only artefacts) are
+        falsy and filtered out during post-processing.
         """
-        return bool(self.content) or bool(self.attachments)
+        return (
+            bool(self.content)
+            or any(
+                slot is None or bool(slot)
+                for slot in (self.attachments or [])
+            )
+            or bool(self.thread_reply_count)
+            or bool(self.thread_replies)
+        )
 
     @classmethod
     def patch(cls, this: MsgDump, that: MsgDump) -> None:
@@ -241,9 +311,11 @@ class ParsingTask(BaseModel):
     """Parameters and parsing logic for a single collection run.
 
     One ``ParsingTask`` instance corresponds to one invocation of the
-    ``pageup`` CLI command.  The runner in ``pageup.runner`` feeds
-    successive ``BeautifulSoup`` snapshots to ``collect_messages`` and
-    calls ``write_json`` once the target date is reached.
+    ``pageup`` CLI command.  The runner feeds successive ``BeautifulSoup``
+    snapshots to ``collect_messages``, calls ``pageup.threads`` to enrich
+    uncollected messages with discussion-panel replies and to restore main-feed
+    focus before each scroll step, then runs ``write_json`` once the target date
+    is reached.
 
     Attributes
     ----------
@@ -254,8 +326,8 @@ class ParsingTask(BaseModel):
         ``https://sberchat.sberbank.ru/#/chat/group796209083``.
     min_date:
         Timezone-aware datetime.  Collection stops when any of these occur:
-        the oldest visible message predates this cutoff; ~60 s of scrolling
-        with no parseable message rows; or ~60 s of scrolling with no new
+        the oldest visible message predates this cutoff; ~30 s of scrolling
+        with no parseable message rows; or ~4 s of scrolling with no new
         ``message_id`` values while history cannot reach this date.
     """
 
@@ -292,7 +364,7 @@ class ParsingTask(BaseModel):
 
     # ── Public interface ──────────────────────────────────────────────────────
 
-    def collect_messages(self, soup: BeautifulSoup) -> list[Message]:
+    def collect_messages(self, soup: BeautifulSoup, *, scope: str = "main") -> list[Message]:
         """Parse all message rows currently visible in *soup*.
 
         Returns a list ordered newest-first (index 0 = most recent message
@@ -304,33 +376,44 @@ class ParsingTask(BaseModel):
         ----------
         soup:
             Parsed HTML snapshot of the current browser page.
+        scope:
+            ``"main"`` parses the main chat feed (excludes rows inside an
+            open thread panel).  ``"thread"`` parses rows inside the
+            discussion panel only.
         """
-        divs: list[Tag] = soup.find_all("div", class_=MSG_WRAP_CLS)
-        messages = []
-        for div in divs:
-            message_id = _tag_attr_str(div.get("data-message-id"))
-            message_date = _tag_attr_str(div.get("data-message-date"))
-            if not message_id or not message_date:
-                # Skip partial DOM rows (e.g. placeholders while React loads).
-                continue
-            try:
-                messages.append(
-                    Message(
-                        message_id=message_id,
-                        date=message_date,
-                        sender_url=self._get_sender_url(div),
-                        sender_name=self._get_sender_name(div, class_=MSG_SENDER_NAME_CLS),
-                        quotes=self._collect_quotes(div),
-                        attachments=self._collect_attachments(div),
-                        content=self._get_message_content(div),
-                    )
-                )
-            except ValidationError:
-                # Skip rows with malformed attributes (e.g. non-numeric date).
-                continue
-        # DOM order is top (oldest) → bottom (newest).  Reversing gives
-        # newest-first, which is what the scroll-loop caller expects.
+        messages = self._collect_row_messages(soup, scope=scope)
         return list(reversed(messages))
+
+    def collect_thread_reply_entries(
+        self,
+        soup: BeautifulSoup,
+        parent_id: str,
+    ) -> list[Entry]:
+        """Parse thread-panel replies, excluding the root *parent_id* message."""
+        rows = [
+            m
+            for m in self._collect_row_messages(soup, scope="thread")
+            if m.message_id != parent_id
+        ]
+        if not rows:
+            return []
+
+        dumps = [m.model_dump() for m in rows]
+        for previous, current in itertools.pairwise(dumps):
+            Message.patch(current, previous)
+
+        entries: list[Entry] = []
+        for message, dump in zip(rows, dumps, strict=True):
+            entries.append(Entry(
+                message_id=message.message_id,
+                date=message.date,
+                sender_url=dump["sender_url"],
+                sender_name=dump["sender_name"],
+                quotes=message.quotes,
+                attachments=message.attachments,
+                content=message.content,
+            ))
+        return entries
 
     def is_done(self, message: Message) -> bool:
         """Return ``True`` when *message* is older than ``min_date``.
@@ -343,15 +426,53 @@ class ParsingTask(BaseModel):
         """
         return message.date < self.min_date
 
+    @staticmethod
+    def prefer_richer_message(existing: Message, incoming: Message) -> Message:
+        """Return *incoming* enriched with the more complete ``thread_replies``."""
+        old_count = len(existing.thread_replies or [])
+        new_count = len(incoming.thread_replies or [])
+        thread_reply_count = (
+            incoming.thread_reply_count or existing.thread_reply_count
+        )
+
+        if new_count > old_count:
+            return incoming.model_copy(update={"thread_reply_count": thread_reply_count})
+        if old_count > new_count:
+            return incoming.model_copy(
+                update={
+                    "thread_replies": existing.thread_replies,
+                    "thread_reply_count": thread_reply_count,
+                }
+            )
+        if old_count > 0 and existing.thread_replies and incoming.thread_replies:
+            # Equal non-zero counts: keep existing replies (they may have richer data
+            # from a prior full collection pass, e.g. sender names that were patched).
+            return incoming.model_copy(
+                update={
+                    "thread_replies": existing.thread_replies,
+                    "thread_reply_count": thread_reply_count,
+                }
+            )
+        return incoming.model_copy(update={"thread_reply_count": thread_reply_count})
+
+    @staticmethod
+    def thread_is_complete(message: Message) -> bool:
+        """Return True when collected thread replies meet the bubble count."""
+        expected = message.thread_reply_count
+        if not expected or expected <= 0:
+            return True
+        replies = message.thread_replies
+        return replies is not None and len(replies) >= expected
+
     def write_json(self, messages: list[Message], write_dir: str) -> None:
         """Deduplicate, order chronologically, patch, and write *messages* to a JSON file.
 
         The output file is placed at ``{write_dir}/{self.name}.json``.
         Post-processing steps applied in order:
 
-        1. **Unique + reverse** — deduplicate by ``message_id`` (batches
-           from successive page snapshots overlap) and reverse to chronological
-           order (oldest first).
+        1. **Unique + sort** — deduplicate by ``message_id`` (batches
+           from successive page snapshots overlap) and sort by ``date``
+           to chronological order (oldest first).
         2. **Dump** — convert each ``Message`` to a plain dict via
            ``model_dump()``.
         3. **Patch** — backfill missing sender info on continuation messages.
@@ -359,14 +480,14 @@ class ParsingTask(BaseModel):
         Parameters
         ----------
         messages:
-            Accumulated message list from the runner (unique by
-            ``message_id``, newest-first).  ``_unique_reversed`` still
-            deduplicates defensively before writing.
+            Accumulated message list from the runner.  May be in any order;
+            ``_unique_reversed`` deduplicates and sorts chronologically before
+            writing.
         write_dir:
             Directory in which to write the output file.  Created by the
             caller before this method is invoked.
         """
-        # tools.Pipeline chains post-processing: dedupe+reverse → dict dump → patch.
+        # tools.Pipeline chains post-processing: dedupe+sort → dict dump → patch.
         # Same Pipeline class as tools.cleaner; keeps write_json declarative.
         postprocessor = Pipeline(
             ParsingTask._unique_reversed,
@@ -389,6 +510,83 @@ class ParsingTask(BaseModel):
 
     # ── Private DOM helpers ───────────────────────────────────────────────────
 
+    def _collect_row_messages(self, soup: BeautifulSoup, *, scope: str) -> list[Message]:
+        """Parse message rows from *soup* in DOM order (oldest first)."""
+        if scope not in {"main", "thread"}:
+            raise ValueError(f"unknown scope {scope!r}; expected 'main' or 'thread'")
+        root = self._scope_root(soup, scope=scope)
+        divs: list[Tag] = root.find_all("div", class_=MSG_WRAP_CLS)
+        messages: list[Message] = []
+        for div in divs:
+            raw_id = _tag_attr_str(div.get("data-message-id"))
+            message_id = normalize_message_id(raw_id) if raw_id else raw_id
+            message_date = _tag_attr_str(div.get("data-message-date"))
+            if not message_id or not message_date:
+                continue
+            try:
+                messages.append(
+                    Message(
+                        message_id=message_id,
+                        date=message_date,
+                        sender_url=self._get_sender_url(div),
+                        sender_name=self._get_sender_name(div, class_=MSG_SENDER_NAME_CLS),
+                        quotes=self._collect_quotes(div),
+                        attachments=self._collect_attachments(div),
+                        content=self._get_message_content(div),
+                        thread_reply_count=(
+                            self._parse_thread_reply_count(div)
+                            if scope == "main"
+                            else None
+                        ),
+                    )
+                )
+            except ValidationError:
+                continue
+        return messages
+
+    @staticmethod
+    def _scope_root(soup: BeautifulSoup, *, scope: str) -> Tag | BeautifulSoup:
+        """Return the DOM subtree to scan for ``MSG_WRAP_CLS`` message rows.
+
+        Main scope prefers the ``MessageList`` container outside ``ThreadContent``.
+        When the discussion panel is open but the main list is unavailable, returns
+        an empty document so panel rows are not collected as main-channel messages.
+
+        Thread scope parses inside the open panel only.  When the panel is absent
+        from *soup*, returns an empty document so main-feed rows are not mistaken
+        for thread replies.
+        """
+        if scope == "thread":
+            panel = soup.find("div", class_=THREAD_PANEL_CLS)
+            if panel is None:
+                return _EMPTY_SCOPE_SOUP
+            container = panel.find("div", class_=MSG_LIST_CONTAINER_CLS)
+            return container if container is not None else panel
+
+        containers = soup.find_all("div", class_=MSG_LIST_CONTAINER_CLS)
+        for container in containers:
+            if container.find_parent("div", class_=THREAD_PANEL_CLS) is None:
+                return container
+        if soup.find("div", class_=THREAD_PANEL_CLS) is None:
+            return soup
+        return _EMPTY_SCOPE_SOUP
+
+    @staticmethod
+    def _parse_thread_reply_count(row: Tag) -> int | None:
+        bubble = row.find("div", class_=THREAD_BUBBLE_CLS)
+        if bubble is None:
+            return None
+        title = bubble.find("span", class_=THREAD_BUBBLE_TITLE_CLS)
+        if title is None:
+            title = bubble.find(class_=THREAD_BUBBLE_TITLE_CLS)
+        if title is None:
+            return None
+        text = title.get_text(strip=True)
+        match = re.search(r"(\d+)\s+ответ(?:а|ов)?", text)
+        if not match:
+            return None
+        return int(match.group(1))
+
     def _get_sender_url(self, elem: Tag) -> str | None:
         """Extract the sender's absolute profile URL from a message element."""
         tag = elem.select_one(MSG_SENDER_URL_SEL)
@@ -410,8 +608,13 @@ class ParsingTask(BaseModel):
         return ParsingTask._get_text(div)
 
     def _get_message_content(self, elem: Tag) -> str:
-        """Extract and concatenate all Lexical text spans in *elem*."""
+        """Extract and concatenate message body text nodes in *elem*."""
         tags = elem.select(MSG_CONTENT_SEL)
+        if not tags:
+            return ""
+        # Prefer outermost matches so nested spans inside a block wrapper
+        # are not concatenated twice when both carry MSG_CONTENT_SEL.
+        tags = [t for t in tags if not any(t in p.descendants for p in tags if p is not t)]
         return " ".join(ParsingTask._get_text(t) for t in tags)
 
     def _collect_quotes(self, elem: Tag) -> list[Quote] | None:
@@ -451,28 +654,40 @@ class ParsingTask(BaseModel):
         # sender/time prefixes that survive when the name precedes HH:MM.
         return ParsingTask._get_text(quote_div)
 
-    def _collect_attachments(self, elem: Tag) -> list[Attachment] | None:
-        """Extract file and media attachments from *elem*.
+    def _collect_attachments(self, elem: Tag) -> list[str | None] | None:
+        """Extract image attachment slots from *elem*.
 
-        Returns ``None`` when the message carries no attachments.
+        Returns ``None`` when the message carries no image attachments.
+
+        Only image attachment blocks (those containing ``MSG_IMAGE_WRAP_CLS``)
+        are recorded.  Video attachments (``VideoMedia-`` / ``PhotoVideoMedia-``)
+        and file blocks are skipped.  Each image slot is ``None`` until
+        ``threads.download_fresh_images`` fills it with the saved filename.
         """
         blocks: list[Tag] = elem.find_all("div", class_=MSG_ATTACHMENT_CLS)
         if not blocks:
             return None
-        attachments = []
-        for block in blocks:
-            name_tag = block.find(class_=ATTACH_NAME_CLS)
-            size_tag = block.find(class_=ATTACH_SIZE_CLS)
-            name = ParsingTask._get_text(name_tag) if name_tag else ""
-            if not name:
-                # Skip attachment blocks that have no parseable filename
-                # (e.g. inline images rendered without a filename cell).
+        image_count = sum(
+            1 for block in blocks if ParsingTask._is_image_attachment_block(block)
+        )
+        return [None] * image_count or None
+
+    @staticmethod
+    def _is_image_attachment_block(block: Tag) -> bool:
+        """Return True for inline image blocks, False for video/file blocks."""
+        if block.find(class_=MSG_IMAGE_WRAP_CLS) is None:
+            return False
+        if block.find("video") is not None:
+            return False
+        for el in block.find_all(True):
+            raw = el.get("class")
+            if not raw:
                 continue
-            attachments.append(Attachment(
-                name=name,
-                size=ParsingTask._get_text(size_tag) if size_tag else None,
-            ))
-        return attachments or None
+            class_list = raw if isinstance(raw, list) else [raw]
+            for cls in class_list:
+                if any(cls.startswith(prefix) for prefix in MSG_VIDEO_MEDIA_PREFIXES):
+                    return False
+        return True
 
     # ── Static post-processing helpers ────────────────────────────────────────
 
@@ -483,20 +698,23 @@ class ParsingTask(BaseModel):
 
     @staticmethod
     def _unique_reversed(messages: list[Message]) -> list[Message]:
-        """Deduplicate and reverse a message list.
+        """Deduplicate and sort a message list chronologically (oldest first).
 
         Successive page snapshots overlap, so the accumulated list can
         contain the same message multiple times.  ``dict.fromkeys``
-        preserves insertion order while dropping duplicates (relies on
-        ``Message.__hash__`` and ``Message.__eq__``).
+        drops duplicates by ``message_id`` via ``Message.__hash__`` and
+        ``Message.__eq__``, keeping the first occurrence.
 
-        After deduplication the list is reversed to produce chronological
-        (oldest-first) order.  Truthy-falsy filtering (``filter(bool, …)``)
-        removes textless, attachment-free messages.
+        The unique set is then sorted by ``(date, message_id)``; input
+        order does not affect the result.  ``message_id`` breaks ties for
+        same-second rows (e.g. continuation messages after their group
+        header).  Truthy-falsy filtering (``filter(bool, …)``) removes
+        rows with no content, attachments, thread bubble, or collected
+        thread replies (see ``Message.__bool__``).
         """
-        # dict.fromkeys keeps the first snapshot seen while scrolling; reversed()
-        # then yields chronological oldest-first order for JSON output.
-        return list(filter(bool, reversed(dict.fromkeys(messages))))
+        unique = list(dict.fromkeys(messages))
+        ordered = sorted(unique, key=lambda message: (message.date, message.message_id))
+        return list(filter(bool, ordered))
 
     @staticmethod
     def _dump_messages(messages: list[Message]) -> list[MsgDump]:

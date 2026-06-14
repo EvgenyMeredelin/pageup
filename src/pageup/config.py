@@ -9,9 +9,22 @@ mode, sleep time, output directory) are exposed as CLI options in
 Consumers:
     runner.py   — SBERBROWSER_*, YANDEX_BROWSER_BINARY, YANDEX_DRIVER,
                   MAX_EMPTY_SCROLL_ATTEMPTS, MAX_STALL_SCROLL_ATTEMPTS,
+                  MAIN_SCROLL_SLEEP_SEC,
                   PAGE_LOAD_TIMEOUT_SEC, SETUP_STATUS_INTERVAL_SEC,
-                  SCROLL_PROGRESS_INTERVAL
-    models.py   — every MSG_* / QUOTE_* / ATTACH_* selector when parsing HTML
+                  SCROLL_PROGRESS_INTERVAL; imports ``pageup.threads`` for
+                  enrich_fresh_threads, download_fresh_images, and
+                  prepare_main_feed_scroll
+    threads.py  — MAX_THREAD_STALL_ATTEMPTS, MAX_THREAD_N_MINUS_ONE_STALL,
+                  MAX_THREAD_BOOTSTRAP_DOWN_STEPS,
+                  MAX_THREAD_ROW_SEARCH_STEPS, MAX_THREAD_OPEN_ATTEMPTS,
+                  MAX_THREAD_PANEL_CLOSE_ATTEMPTS,
+                  THREAD_PANEL_OPEN_TIMEOUT_SEC,
+                  THREAD_PANEL_CLOSE_TIMEOUT_SEC, SCROLL_PROGRESS_INTERVAL,
+                  THREAD_* selectors, MSG_LIST_CONTAINER_CLS,
+                  MSG_ATTACHMENT_CLS, MSG_IMAGE_WRAP_CLS,
+                  MSG_IMAGE_MEDIA_CLICKABLE_SUBCLS,
+                  IMAGE_GALLERY_* selectors/timeouts, MIN_FULL_IMAGE_PX
+    models.py   — every MSG_* / QUOTE_* / THREAD_* selector when parsing HTML
 
 Three groups of constants are defined here:
 
@@ -37,11 +50,26 @@ Three groups of constants are defined here:
 3. **Scroll safety and runner timing** — ``MAX_EMPTY_SCROLL_ATTEMPTS`` caps
    how long the runner keeps scrolling when no message rows appear in the
    DOM; ``MAX_STALL_SCROLL_ATTEMPTS`` caps scrolling when rows are visible
-   but no new ``message_id`` values appear.  ``PAGE_LOAD_TIMEOUT_SEC`` limits
-   ``driver.get()`` on personal-device SPA routes only (Sigma uses blocking
-   navigation with no timeout).  ``SETUP_STATUS_INTERVAL_SEC`` and
-   ``SCROLL_PROGRESS_INTERVAL`` control how often setup and scroll progress
-   lines are printed.
+   but no new ``message_id`` values appear; ``MAIN_SCROLL_SLEEP_SEC`` is the
+   sleep duration between consecutive scroll steps (0.5 s by default);
+   ``MAX_THREAD_STALL_ATTEMPTS`` caps thread-panel inner scroll (JS
+   ``scrollTop`` ~five viewport heights per step with 1 s pauses);
+   ``MAX_THREAD_N_MINUS_ONE_STALL`` provides a fast exit when the collected
+   count is exactly N−1 and has not changed for this many steps
+   (deleted/unparseable replies will never appear);
+   ``MAX_THREAD_BOOTSTRAP_DOWN_STEPS`` scrolls a newly opened panel to its
+   bottom so lazy replies mount; ``MAX_THREAD_ROW_SEARCH_STEPS`` scrolls the
+   main feed to locate a virtualized row before opening its thread bubble;
+   ``MAX_THREAD_OPEN_ATTEMPTS`` caps how many times the same bubble is opened
+   per run when collection keeps failing;
+   ``THREAD_PANEL_OPEN_TIMEOUT_SEC`` waits for panel open after bubble
+   clicks; ``THREAD_PANEL_CLOSE_TIMEOUT_SEC`` waits after each close attempt;
+   ``MAX_THREAD_PANEL_CLOSE_ATTEMPTS`` caps close-button + main-feed refocus in
+   ``_close_panel``.
+   ``PAGE_LOAD_TIMEOUT_SEC`` limits ``driver.get()`` on personal-device SPA
+   routes only (Sigma uses blocking navigation with no timeout).
+   ``SETUP_STATUS_INTERVAL_SEC`` and ``SCROLL_PROGRESS_INTERVAL`` control
+   how often setup and scroll progress lines are printed.
 """
 
 import os
@@ -51,13 +79,20 @@ from typing import Final
 
 # Safety limit used in runner.run(): if the DOM never yields parseable message
 # rows (wrong page, chat not loaded, focus lost), we stop instead of scrolling
-# forever.  Each failed attempt scrolls up once and sleeps 1 s → 60 s total.
+# forever.  Each failed attempt scrolls up once and sleeps MAIN_SCROLL_SLEEP_SEC
+# → 30 s total at 0.5 s default.
 MAX_EMPTY_SCROLL_ATTEMPTS: Final[int] = 60
 
 # Safety limit used in runner.run(): if scrolling no longer discovers unseen
 # message_id values (e.g. min_date predates chat history), we stop instead of
-# scrolling forever.  Each stall iteration scrolls up once and sleeps 1 s → 60 s.
-MAX_STALL_SCROLL_ATTEMPTS: Final[int] = 60
+# scrolling forever.  Each stall iteration scrolls up once and sleeps
+# MAIN_SCROLL_SLEEP_SEC → 4 s total at 0.5 s default.
+MAX_STALL_SCROLL_ATTEMPTS: Final[int] = 8
+
+# runner.run(): sleep between consecutive scroll iterations (both empty-DOM and
+# non-empty branches).  0.5 s gives React ~two render cycles to mount new rows;
+# 1 s was the original value but is unnecessarily slow for well-loaded chats.
+MAIN_SCROLL_SLEEP_SEC: Final[float] = 0.5
 
 # runner.create_driver(trusted_device=False): Selenium page-load timeout for
 # driver.get() on SPA hash routes.  Trusted Sigma mode does not set this —
@@ -67,6 +102,40 @@ PAGE_LOAD_TIMEOUT_SEC: Final[int] = 120
 # runner.run(): newline status interval during setup countdown and scroll loop.
 SETUP_STATUS_INTERVAL_SEC: Final[int] = 10
 SCROLL_PROGRESS_INTERVAL: Final[int] = 10
+
+# threads._collect_thread_panel_replies(): inner scroll cap when a thread panel stops
+# revealing new reply message_id values (~60 s total; JS scrollTop ~five viewport
+# heights per step with 1 s pauses — same timing cadence as the main loop).
+MAX_THREAD_STALL_ATTEMPTS: Final[int] = 60
+
+# threads._collect_thread_panel_replies(): fast-exit when the collected count is
+# exactly N−1 and has not changed for this many consecutive stall steps.  The
+# bubble count can include deleted or unparseable replies that will never appear,
+# so waiting the full 60 s budget is wasteful.  Set ≥ MAX_THREAD_STALL_ATTEMPTS
+# to disable the fast exit and always wait the full budget.
+MAX_THREAD_N_MINUS_ONE_STALL: Final[int] = 5
+
+# threads._bootstrap_thread_panel_scroll(): scroll down after panel open so lazy-
+# loaded replies below the root message mount before the upward collection pass.
+MAX_THREAD_BOOTSTRAP_DOWN_STEPS: Final[int] = 15
+
+# threads._find_row_in_main_feed(): scroll the main feed up then down (~0.25 s per
+# step) searching for a message row SberChat removed from the live DOM.
+MAX_THREAD_ROW_SEARCH_STEPS: Final[int] = 20
+
+# threads.enrich_fresh_threads(): open the same bubble at most this many times
+# per run when collection keeps failing while the group chat stays open.
+MAX_THREAD_OPEN_ATTEMPTS: Final[int] = 3
+
+# threads._open_thread_and_collect(): wait for panel to appear after bubble click.
+THREAD_PANEL_OPEN_TIMEOUT_SEC: Final[int] = 10
+
+# threads._close_panel(): wait for panel to disappear after each close attempt.
+# Shorter than open timeout so fallbacks (main-feed focus) run sooner.
+THREAD_PANEL_CLOSE_TIMEOUT_SEC: Final[int] = 3
+
+# threads._close_panel(): close-button + main-feed refocus attempts before giving up.
+MAX_THREAD_PANEL_CLOSE_ATTEMPTS: Final[int] = 3
 
 # ── Sberbrowser paths (Sigma / trusted-device mode only) ─────────────────────
 
@@ -107,20 +176,84 @@ MSG_SENDER_URL_SEL: Final[str] = "a.MessageTitle-LinkToAuthor__cls1"
 # Display name text node (e.g. "Иван Петров").
 MSG_SENDER_NAME_CLS: Final[str] = "CustomStatusIcon-ChatHeaderStatusTitle__cls1"
 
-# Lexical-rendered body text; a message may contain multiple matching spans.
-# Compound selector; select() in _get_message_content() may return several nodes.
-MSG_CONTENT_SEL: Final[str] = "span.BlockMessageStyleComponent-BlockMessageText__cls1"
+# Message body text (block or inline).  Thread replies often use a <div> wrapper.
+MSG_CONTENT_SEL: Final[str] = ".BlockMessageStyleComponent-BlockMessageText__cls1"
+
+# Main chat infinite list — excludes MessageList inside ThreadContent when panel open.
+MSG_LIST_CONTAINER_CLS: Final[str] = "MessageList-MessagesContainer__cls1"
+
+# ── Thread / discussion panel ─────────────────────────────────────────────────
+
+# Green "N ответа" bubble under a main-channel message (click target).
+THREAD_BUBBLE_CLS: Final[str] = "MessageThreadPanel-MessageThreadPanelWrapper__cls1"
+
+# Reply count label inside the bubble (e.g. "3 ответа").
+THREAD_BUBBLE_TITLE_CLS: Final[str] = "MessageThreadPanel-MessageThreadPanelTitle__cls1"
+
+# Side panel container opened by the bubble ("Обсуждение").
+THREAD_PANEL_CLS: Final[str] = "ThreadContent-ThreadWrapper__cls1"
+
+# Close button in the thread panel header.
+THREAD_PANEL_CLOSE_SEL: Final[str] = 'button[aria-label="Закрыть окно"]'
 
 # ── File / media attachments ──────────────────────────────────────────────────
 
 # Wrapper around a file or image attachment block inside a message row.
 MSG_ATTACHMENT_CLS: Final[str] = "BlockMessageStyleComponent-DocumentBlock__cls1"
 
-# Filename label shown in the attachment cell (e.g. "report.pdf").
-ATTACH_NAME_CLS: Final[str] = "Title-TitleContent__cls1"
+# Inner wrapper for inline image attachments.  Present only when the attachment
+# is an image (no filename cell); used by _collect_attachments to distinguish
+# image blocks from file blocks, and by download_fresh_images to scope the
+# click target search within a message row.
+MSG_IMAGE_WRAP_CLS: Final[str] = "MessageImage-MessageImageWrapper__cls1"
 
-# Human-readable size subtitle (e.g. "1.2 МБ"); may be absent for inline images.
-ATTACH_SIZE_CLS: Final[str] = "MessageFileCellV2-FileSubtitle__cls1"
+# Inline video attachments share MessageMedia clickables but use VideoMedia /
+# PhotoVideoMedia wrappers — never treat them as image slots or click targets.
+MSG_VIDEO_MEDIA_PREFIXES: Final[tuple[str, ...]] = (
+    "VideoMedia-",
+    "PhotoVideoMedia-",
+)
+
+# Clickable overlay on inline chat images (opens the full-screen gallery).
+# Modifier class on MessageMedia-MessageMediaWrapper; matched via substring in
+# threads._image_click_targets because it has no __clsN suffix.
+MSG_IMAGE_MEDIA_CLICKABLE_SUBCLS: Final[str] = (
+    "MessageMedia-MessageMediaWrapper__clickable"
+)
+
+# Full-screen image gallery opened by clicking an inline attachment.
+# Overlays are position:fixed — never gate visibility on offsetParent.
+IMAGE_GALLERY_WRAP_CLS: Final[str] = "ImageGalleryUi-ImageGalleryUiWrapper__cls1"
+IMAGE_GALLERY_V2_WRAP_CLS: Final[str] = "ImageGalleryV2-ImageGalleryContent__cls1"
+IMAGE_GALLERY_V2_DIALOG_CLS: Final[str] = "ImageGalleryV2-DialogImage__cls1"
+IMAGE_GALLERY_WRAP_CLASSES: Final[tuple[str, ...]] = (
+    IMAGE_GALLERY_WRAP_CLS,
+    IMAGE_GALLERY_V2_WRAP_CLS,
+    IMAGE_GALLERY_V2_DIALOG_CLS,
+)
+IMAGE_GALLERY_IMG_CLS: Final[str] = "Image-ImageElement__cls1"
+IMAGE_GALLERY_TOPBAR_CLS: Final[str] = "ImageGalleryUi-ImageGalleryTopBar__cls1"
+# Close icon in the gallery top bar (first button in DOM; flex-end renders it rightmost).
+IMAGE_GALLERY_CLOSE_ICON_ARIA: Final[str] = "sbc_line_close_line"
+# Download control inside the open gallery — never click; Chrome saves image.png → ~/Downloads.
+IMAGE_GALLERY_DOWNLOAD_BTN_SEL: Final[str] = (
+    '[class*="ImageGalleryUi-ImageGalleryUiWrapper"], '
+    '[class*="ImageGalleryV2-DialogImage"] '
+    'button[aria-label="Скачать"]'
+)
+
+# Gallery timing: FETCH covers open+load polling in _FETCH_GALLERY_IMAGE_JS; CLOSE
+# is used by _close_image_gallery.  OPEN and LOAD are summands of FETCH only.
+IMAGE_GALLERY_OPEN_TIMEOUT_SEC: Final[int] = 10
+IMAGE_GALLERY_LOAD_TIMEOUT_SEC: Final[int] = 15
+IMAGE_GALLERY_FETCH_TIMEOUT_SEC: Final[int] = (
+    IMAGE_GALLERY_OPEN_TIMEOUT_SEC + IMAGE_GALLERY_LOAD_TIMEOUT_SEC
+)
+IMAGE_GALLERY_CLOSE_TIMEOUT_SEC: Final[int] = 3
+
+# SberChat inline thumbnails (FastThumb) are 90 px on the long edge; reject
+# payloads at or below this size so we never persist preview blobs as originals.
+MIN_FULL_IMAGE_PX: Final[int] = 90
 
 # ── Quoted / reply messages ───────────────────────────────────────────────────
 

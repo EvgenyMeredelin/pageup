@@ -7,7 +7,7 @@
 <h1 align="center">pageup</h1>
 
 <p align="center">
-  Collect messages from a SberChat group chat into structured JSON.
+  Collect messages and thread replies from a SberChat group chat into structured JSON.
 </p>
 
 <p align="center">
@@ -49,14 +49,16 @@
 ## Overview · [↑](#toc)
 
 **pageup** is a Python CLI that collects messages from a [SberChat](https://sberchat.sberbank.ru/)
-group chat and writes them to a structured JSON file.
+group chat — including discussion-thread replies behind green "N ответа" bubbles —
+and writes them to a structured JSON file.
 
 SberChat exposes no public API.  The tool drives a real browser with
 [Selenium](https://www.selenium.dev/), scrolls the chat history upward in
 large batches (20 page-up key events per iteration), parses each rendered
 snapshot with
 [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/) (lxml backend),
-and accumulates deduplicated messages until it reaches the requested start date.
+opens uncollected thread discussion panels, and accumulates deduplicated messages
+until it reaches the requested start date.
 
 The authoritative runtime is **Sigma** — Sberbank's internal OS — because only
 a Sigma trusted device can retrieve chat history beyond the last 7 days.
@@ -124,6 +126,24 @@ rootless, and requires no background service.  The container wrapper script trie
 Podman first, then falls back to Docker — same `run` invocation, no workflow fork.
 Docker is a compatibility fallback; Sigma runs neither.
 
+### Thread replies (discussion panels)
+
+Messages with a green **"N ответа"** bubble store replies in a lazy-loaded
+side panel ("Обсуждение"), not in the main feed DOM.  During the scroll loop,
+pageup opens each uncollected green bubble (JavaScript click on the bubble only),
+scrolls the panel via JavaScript ``scrollTop`` (bootstrap scroll-down to load
+lazy replies, then alternating up/down while collecting; ~five viewport heights
+per inner step with 1 s pauses — same timing cadence as the main loop; thread
+text and links are not clicked during reply collection — image attachments are
+downloaded separately by opening the full-screen gallery),
+parses replies, closes the panel, focuses the main feed before the next main
+scroll, and attaches them as ``thread_replies`` on the parent message.  Inner
+scroll uses the full ``MAX_THREAD_STALL_ATTEMPTS`` (~60 s); when it ends
+exactly one reply short of the bubble count, a warning is logged (bubble
+count may include unparseable rows).  Transient open failures
+retry on later scroll batches until ``MAX_THREAD_OPEN_ATTEMPTS`` per message.  Busy channels with many threaded
+messages take significantly longer than message-only collection.
+
 ---
 
 <a id="sigma-integration-context"></a>
@@ -136,7 +156,7 @@ for Sigma.  See [Build artefacts in `dist/`](#build-artefacts-in-dist) for what
 every file in `dist/` is, what you can delete, and why.
 
 ```
-pageup-sigma-0.1.0-linux-x86_64.tar.gz
+pageup-sigma-0.2.0-linux-x86_64.tar.gz
   pageup-sigma/
     lib/python3.13/site-packages/   # pageup + all locked cp313 wheels
     README-SIGMA.txt
@@ -178,7 +198,7 @@ After `bash scripts/pack-for-sigma-docker.sh`, several files appear under
 ### What is a tarball?
 
 A **tarball** is a single compressed archive — here,
-`pageup-sigma-0.1.0-linux-x86_64.tar.gz`.  The `.tar` part collects a directory
+`pageup-sigma-0.2.0-linux-x86_64.tar.gz`.  The `.tar` part collects a directory
 tree into one file; `.gz` compresses it with gzip.  On Sigma you unpack it with
 `tar xzf …`, which recreates the `pageup-sigma/` folder under `~/projects`.
 It is the Linux equivalent of a zip file: one file to upload via `oait-bucket`,
@@ -221,12 +241,12 @@ on Fedora.
 Both are side effects of `uv build`, which `pack-for-sigma.sh` runs before
 assembling the Sigma bundle:
 
-- **`pageup-0.1.0-py3-none-any.whl`** — a built copy of the pageup package.
+- **`pageup-0.2.0-py3-none-any.whl`** — a built copy of the pageup package.
   The pack script installs this wheel (plus locked dependencies) into
   `pageup-sigma/lib/python3.13/site-packages/`.  After the bundle tarball is
   built, the standalone wheel on Fedora serves no further purpose.
 
-- **`pageup-0.1.0.tar.gz`** — a source distribution (sdist) in the standard
+- **`pageup-0.2.0.tar.gz`** — a source distribution (sdist) in the standard
   Python packaging format.  Useful if you ever publish pageup to PyPI; **not
   used** in the Sigma deploy workflow at all.
 
@@ -276,18 +296,18 @@ flowchart TD
     browser["Open group URL\n(Yandex Browser or Sberbrowser)"]
     nav["Auth: confirm .p12, OTP\nSigma: blocking · personal: eager 120 s\n(personal continues on timeout)"]
     setup["Setup countdown: scroll to latest,\nclick inside the chat"]
-    capture["Capture page_source → parse HTML\n→ extract message rows"]
+    capture["Capture page_source → parse HTML\n→ extract rows + thread counts"]
     empty{"Any rows?"}
     emptyInc["empty_scroll_attempts += 1"]
     emptyGuard{"Empty limit\nreached?"}
-    emptyAbort["Empty-DOM abort\n~60 s, no rows"]
+    emptyAbort["Empty-DOM abort\n~30 s, no rows"]
     check{"Oldest message\nbefore min_date?"}
     stall{"Any unseen\nmessage_id?"}
-    stallAbort["Stall abort\n~60 s, all IDs seen"]
-    tail["Extend in-range tail only"]
-    accum["Extend in-range visible rows"]
-    scroll["20 × PAGE_UP → sleep 1 s"]
-    done["Dedupe · reverse · patch · write JSON"]
+    stallAbort["Stall abort\n~4 s, all IDs seen"]
+    tail["Extend in-range tail + thread replies"]
+    accum["Extend in-range rows + thread replies"]
+    scroll["Close panel · focus main feed\n→ 20 × PAGE_UP → sleep 0.5 s"]
+    done["Dedupe · sort · patch · write JSON"]
 
     cli --> browser --> nav --> setup --> capture --> empty
     empty -->|No| emptyInc --> emptyGuard
@@ -297,7 +317,7 @@ flowchart TD
     check -->|Yes| tail --> done
     check -->|No| stall
     stall -->|Fresh ID| accum --> scroll --> capture
-    stall -->|"All seen ×60"| stallAbort --> done
+    stall -->|"All seen ×8"| stallAbort --> done
     stall -->|All seen below limit| accum --> scroll --> capture
 ```
 
@@ -308,8 +328,9 @@ src/pageup/
 ├── __init__.py — Package metadata and version string
 ├── __main__.py — `python3 -m pageup` entry (Sigma deploy via PYTHONPATH)
 ├── cli.py      — Typer app; argv → ParsingTask → runner.run()
-├── runner.py   — Browser session, scroll loop, Ctrl+C and error handlers
-├── models.py   — Pydantic Message / ParsingTask; HTML parsing, dedup, write_json
+├── runner.py   — Browser session, scroll loop, uncollected thread enrichment, panel close + main-feed focus, Ctrl+C handlers
+├── threads.py  — Discussion panel open/scroll/close (JS scroll/focus); bubble/close JS click; thread_replies
+├── models.py   — Pydantic Quote / Entry / Message / ParsingTask; HTML parsing, dedup, write_json
 ├── config.py   — Compile-time constants: paths, selectors, timing
 └── tools.py    — Text cleaning pipeline, URL pattern, Moscow timezone
 ```
@@ -319,9 +340,9 @@ collected messages are written to the JSON file (empty array if the scroll loop
 has not yet started).  Unexpected errors during the run also persist partial
 output before the process exits.
 
-If no message rows appear after 60 upward scroll attempts (~60 s), the run stops
+If no message rows appear after 60 upward scroll attempts (~30 s), the run stops
 with a warning and writes whatever was collected.  The same happens when rows
-are still visible but no new `message_id` values appear for ~60 s — for example
+are still visible but no new `message_id` values appear for ~4 s — for example
 when `min_date` is earlier than the chat's creation date.
 
 ---
@@ -362,7 +383,8 @@ source .venv/bin/activate
 pageup --help
 ```
 
-Default output: `~/projects/pageup-results/{name}.json`.
+Default output: `~/projects/pageup-results/YYYY-MM-DDTHH-MM-SS/{name}.json`
+(Moscow-timestamped subdirectory created automatically per run).
 
 Run the test suite to confirm everything is wired correctly:
 
@@ -454,7 +476,8 @@ pageup \
 # --sleep-time 60                        # default
 ```
 
-Output: `~/projects/pageup-results/AI in Dev Community.json`.
+Output: `~/projects/pageup-results/2026-06-14T18-14-00/AI in Dev Community.json`
+(Moscow-timestamped subdirectory; images in `…/2026-06-14T18-14-00/attachments/`).
 
 **During navigation:** confirm the client `.p12` and enter the OTP when prompted.
 On Sigma, `driver.get()` blocks until navigation and authentication finish —
@@ -465,6 +488,9 @@ message and click inside it to ensure the chat has keyboard focus.  The scroll
 loop starts automatically when the countdown expires.  If the browser window is
 open but the client certificate (`.p12`) selection dialog never appeared, stop
 the run (`Ctrl+C`) and start again.  See `pageup --help`.
+
+Thread replies (green "N ответа" bubbles) are collected automatically during
+scrolling; channels with many threads take much longer than message-only runs.
 
 ---
 
@@ -485,7 +511,9 @@ pageup \
 ```
 
 Use a `min_date` within the last 7 days — personal mode cannot reach older history.
-Output: `~/projects/pageup-results/AI in Dev Community.json`.
+Output: `~/projects/pageup-results/2026-06-14T18-14-00/AI in Dev Community.json`.
+
+Thread replies are collected automatically during scrolling (same as Sigma mode).
 
 ---
 
@@ -516,9 +544,9 @@ Output: `~/projects/pageup-results/AI in Dev Community.json`.
 	# --write-dir ~/projects/pageup-results  # default
 	# --sleep-time 60                        # default
 	```
-	Во время обратного отсчета `--sleep-time` (по умолчанию 60 с): прокрутить чат до последнего сообщения и кликнуть внутри него, чтобы обеспечить фокус клавиатуры на чате. Цикл прокрутки стартует автоматически после окончания отсчета. Если окно браузера открыто, но окно выбора клиентского сертификата (`*.p12`) не появилось, прервать работу (`Ctrl+C`) и запустить снова. Справка: `pageup --help`
+	Во время обратного отсчета `--sleep-time` (по умолчанию 60 с): прокрутить чат до последнего сообщения и кликнуть внутри него, чтобы обеспечить фокус клавиатуры на чате. Цикл прокрутки стартует автоматически после окончания отсчета. Если окно браузера открыто, но окно выбора клиентского сертификата (`*.p12`) не появилось, прервать работу (`Ctrl+C`) и запустить снова. Справка: `pageup --help`. Ответы в тредах (зелёные «N ответа») собираются автоматически во время прокрутки; в активных чатах это занимает больше времени.
 
-5. Результат: `~/projects/pageup-results/AI in Dev Community.json`
+5. Результат: `~/projects/pageup-results/2026-06-14T18-14-00/AI in Dev Community.json`
 
 ---
 
@@ -530,16 +558,16 @@ Run `pageup --help` for the full Typer output.  Summary:
 ```
 Usage: pageup [OPTIONS]
 
-  Collect SberChat group messages and write them to a JSON file.
+  Collect SberChat group messages, thread replies, and write JSON.
 
 Options:
-  -n, --name TEXT                 Output file {write-dir}/{name}.json  [required]
+  -n, --name TEXT                 Output filename (e.g. {write-dir}/2026-06-14T18-14-00/{name}.json)  [required]
   --group-url TEXT                Full group URL, no trailing slash or query  [required]
   --min-date TEXT                 YYYYMMDD, midnight Moscow; full day included  [required]
   --trusted-device / --personal-device
                                   Sigma Sberbrowser (default) vs Yandex Browser
   --sleep-time INTEGER            Post-navigation setup seconds  [default: 60, min: 1]
-  --write-dir TEXT                Output directory  [default: ~/projects/pageup-results]
+  --write-dir TEXT                Base output dir; run creates {write-dir}/YYYY-MM-DDTHH-MM-SS/  [default: ~/projects/pageup-results]
   --version                       Print version and exit
   --help                          Show help
 ```
@@ -554,8 +582,8 @@ shell scripts.
 
 **`--min-date`** is interpreted as midnight Moscow time on the given calendar day.
 Messages from the full day are included.  Collection stops when any of these occur:
-the oldest visible message predates this cutoff; ~60 s of scrolling with no parseable
-message rows; or ~60 s of scrolling with no new message IDs while history cannot
+the oldest visible message predates this cutoff; ~30 s of scrolling with no parseable
+message rows; or ~4 s of scrolling with no new message IDs while history cannot
 reach this date.
 
 ---
@@ -563,31 +591,53 @@ reach this date.
 <a id="output-format"></a>
 ## Output format · [↑](#toc)
 
-Messages are written to `~/projects/pageup-results/{name}.json` as a JSON array, oldest first.
-`quotes` and `attachments` are `null` when absent.
+Messages are written to `~/projects/pageup-results/YYYY-MM-DDTHH-MM-SS/{name}.json` as a JSON array, oldest first.
+Each run creates a fresh Moscow-timestamped subdirectory inside `--write-dir`; downloaded images land in `…/attachments/`.
+`quotes`, `attachments`, and `thread_replies` are `null` when absent.
 
 ```json
 [
     {
+        "message_id": "3433723619238416881_779047953112235851",
         "date": "2025-09-01 09:14:22+03:00",
         "sender_url": "https://sberchat.sberbank.ru/#/chat/private1234567890",
         "sender_name": "Иван Петров",
+        "content": "Готово, смотри файл выше.",
+        "thread_reply_count": 3,
+        "thread_replies": [
+            {
+                "message_id": "3433723619238416882_779047953112235852",
+                "date": "2025-09-01 10:02:11+03:00",
+                "sender_url": "https://sberchat.sberbank.ru/#/chat/private9876543210",
+                "sender_name": "Мария Сидорова",
+                "attachments": null,
+                "content": "Попробуйте export PATH=…"
+            }
+        ],
         "quotes": [{"sender_name": "Мария Сидорова", "content": "Когда будет готово?"}],
-        "attachments": [{"name": "report-q3.pdf", "size": "1.2 МБ"}],
-        "content": "Готово, смотри файл выше."
+        "attachments": ["3433723619238416881_779047953112235851_0.png"]
     }
 ]
 ```
 
 | Field | Type | Notes |
 |---|---|---|
+| `message_id` | string | SberChat row identifier; `|` replaced with `_` for filesystem safety |
 | `date` | string | Moscow time (`+03:00`) |
 | `sender_url` | string \| null | backfilled on continuation rows (same sender, consecutive messages) |
 | `sender_name` | string \| null | backfilled on continuation rows |
-| `quotes` | array \| null | embedded reply previews |
-| `quotes[].sender_name` | string \| null | quoted author; `null` when absent |
-| `attachments` | array \| null | files or media; `size` may be `null` for inline images |
 | `content` | string | cleaned message text |
+| `thread_reply_count` | integer \| null | reply count from the green thread bubble; `null` when no bubble |
+| `thread_replies` | array \| null | discussion-panel replies (excludes the root message); `null` when none collected |
+| `thread_replies[].message_id` | string | reply row identifier |
+| `thread_replies[].date` | string | Moscow time |
+| `thread_replies[].sender_url` | string \| null | reply author profile URL |
+| `thread_replies[].sender_name` | string \| null | reply author display name |
+| `thread_replies[].attachments` | array \| null | downloaded image filenames (full-resolution via gallery); `null` when none |
+| `thread_replies[].content` | string | cleaned reply text |
+| `quotes` | array \| null | embedded inline reply previews (not thread replies) |
+| `quotes[].sender_name` | string \| null | quoted author; `null` when absent |
+| `attachments` | array \| null | downloaded image filenames (e.g. `["…_0.png"]`); full-resolution via gallery click; `null` when none |
 
 **Continuation rows:** SberChat omits the sender header when the same person sends
 consecutive messages.  `write_json` backfills `sender_url` and `sender_name` from
@@ -610,11 +660,20 @@ the next `pageup` run.  On Sigma, edit the deployed copy at
 
 | Constant | Default | Role |
 |---|---|---|
-| `MAX_EMPTY_SCROLL_ATTEMPTS` | 60 | Empty-DOM scroll cap — stops after ~60 s with no rows |
-| `MAX_STALL_SCROLL_ATTEMPTS` | 60 | Stall scroll cap — stops after ~60 s when visible rows repeat with no new `message_id` (e.g. `min_date` before chat creation) |
+| `MAX_EMPTY_SCROLL_ATTEMPTS` | 60 | Empty-DOM scroll cap — stops after ~60 × `MAIN_SCROLL_SLEEP_SEC` with no rows |
+| `MAX_STALL_SCROLL_ATTEMPTS` | 8 | Stall scroll cap — stops after ~8 × `MAIN_SCROLL_SLEEP_SEC` when visible rows repeat with no new `message_id` (e.g. `min_date` before chat creation) |
+| `MAIN_SCROLL_SLEEP_SEC` | 0.5 | Sleep between consecutive scroll iterations (seconds); 0.5 s lets React render ~two frames before the next parse |
 | `PAGE_LOAD_TIMEOUT_SEC` | 120 | `driver.get()` timeout — **personal device only** |
 | `SETUP_STATUS_INTERVAL_SEC` | 10 | Setup countdown log interval (seconds) |
 | `SCROLL_PROGRESS_INTERVAL` | 10 | Scroll progress log interval |
+| `MAX_THREAD_STALL_ATTEMPTS` | 60 | Thread-panel inner scroll cap (~60 s; JS ``scrollTop`` ~five viewport heights per step with 1 s pauses) |
+| `MAX_THREAD_BOOTSTRAP_DOWN_STEPS` | 15 | After opening a panel, scroll down this many times so lazy replies below the root mount |
+| `MAX_THREAD_ROW_SEARCH_STEPS` | 20 | Main-feed scroll steps (up then down) searching for a virtualized row before opening its bubble |
+| `MAX_THREAD_OPEN_ATTEMPTS` | 3 | Same bubble opened at most this many times per run when collection keeps failing |
+| `MAX_THREAD_N_MINUS_ONE_STALL` | 5 | Fast exit when inner scroll is stuck at exactly N−1 replies for this many stall steps (bubble count may include a deleted/unparseable reply) |
+| `MAX_THREAD_PANEL_CLOSE_ATTEMPTS` | 3 | Close-button + main-feed refocus attempts before giving up on panel close |
+| `THREAD_PANEL_OPEN_TIMEOUT_SEC` | 10 | Wait for discussion panel after bubble click |
+| `THREAD_PANEL_CLOSE_TIMEOUT_SEC` | 3 | Wait after each panel-close attempt before trying main-feed refocus |
 
 ### Browser paths
 
@@ -637,11 +696,21 @@ stay aligned with production selectors.
 | `MSG_WRAP_CLS` | Outermost message row `<div>` |
 | `MSG_SENDER_URL_SEL` | Author profile link (`href` → sender URL) |
 | `MSG_SENDER_NAME_CLS` | Author display name text node |
-| `MSG_CONTENT_SEL` | Message body spans |
+| `MSG_CONTENT_SEL` | Message body text (`div` or `span`) |
+| `MSG_LIST_CONTAINER_CLS` | Main chat message list container |
 | `MSG_ATTACHMENT_CLS` | Attachment block wrapper |
-| `ATTACH_NAME_CLS` / `ATTACH_SIZE_CLS` | Attachment filename and size label |
-| `QUOTE_WRAP_CLS` | Embedded reply preview block |
+| `MSG_IMAGE_WRAP_CLS` | Inner image wrapper inside an image block (distinguishes images from file-only blocks; only image blocks are recorded) |
+| `MSG_IMAGE_MEDIA_CLICKABLE_SUBCLS` | Click target on inline images (opens full-screen gallery for original-resolution download) |
+| `MSG_VIDEO_MEDIA_PREFIXES` | Inline video block class prefixes (`VideoMedia-`, `PhotoVideoMedia-`); excluded from attachment slots and gallery clicks |
+| `IMAGE_GALLERY_WRAP_CLS` / `IMAGE_GALLERY_V2_*` | Gallery overlay roots (`ImageGalleryUi`, `ImageGalleryV2` content/dialog) |
+| `IMAGE_GALLERY_IMG_CLS` | Full-resolution `<img>` inside the gallery |
+| `IMAGE_GALLERY_CLOSE_ICON_ARIA` | Gallery top-bar ✕ icon (`sbc_line_close_line`); used to close without triggering «Скачать» |
+| `QUOTE_WRAP_CLS` | Embedded inline reply preview block |
 | `QUOTE_SENDER_NAME_CLS` / `QUOTE_CONTENT_SEL` | Quoted author and text |
+| `THREAD_BUBBLE_CLS` | Green "N ответа" thread bubble (click target) |
+| `THREAD_BUBBLE_TITLE_CLS` | Reply count label inside the bubble |
+| `THREAD_PANEL_CLS` | Discussion side panel ("Обсуждение") |
+| `THREAD_PANEL_CLOSE_SEL` | Close button in the thread panel header |
 
 ---
 
@@ -660,9 +729,10 @@ Repository layout (essentials):
 
 ```
 pageup/
-├── src/pageup/          # package: cli, runner, models, config, tools
+├── src/pageup/          # package: cli, runner, threads, models, config, tools
 ├── scripts/             # three scripts above
-├── tests/               # unit tests + synthetic HTML fixtures
+├── tests/               # unit tests and fixtures.py
+│   └── data/            # real DOM excerpts (e.g. sberchat-thread-panel-excerpt.html)
 ├── docs/                # Sber certificate guide for Fedora
 ├── dist/                # build artefacts (gitignored except .gitignore)
 ├── pyproject.toml
@@ -683,11 +753,18 @@ pageup/
 - **`opening group URL` but no setup countdown** — complete cert/OTP first; on Sigma `driver.get()` blocks until navigation finishes.
 - **Browser open but no `.p12` certificate picker** — stop the run (Ctrl+C) and start again; authentication did not begin correctly.
 - **"Kerberos Unsupported" in window title** — `create_driver` must pass two separate `--disable-features` flags (`SberAuth`, then `SberSync`); they must never be combined into one flag.
-- **Run stops with `no messages found after repeated scrolling`** — no parseable message rows for ~60 s; wrong page, chat not loaded, or focus lost during the setup countdown.
-- **Run stops with `min_date may predate chat history`** — rows were visible but no new message IDs appeared for ~60 s; `min_date` is earlier than the chat's creation date or history is exhausted.
+- **Run stops with `no messages found after repeated scrolling`** — no parseable message rows for ~30 s; wrong page, chat not loaded, or focus lost during the setup countdown.
+- **Run stops with `min_date may predate chat history`** — rows were visible but no new message IDs appeared for ~4 s; `min_date` is earlier than the chat's creation date or history is exhausted.
 - **Empty JSON after run** — chat was not focused or wrong page was open; increase `--sleep-time` and click inside the chat during the countdown.
 - **Run ends with `Fatal error:`** — an unexpected exception occurred; partial messages collected before the error are still written to JSON.
 - **Partial rows in output** — message rows with malformed `data-message-date` values are skipped silently during parsing.
+- **Thread replies missing or partial** — collection opens each uncollected green bubble and scrolls the discussion panel; busy channels take much longer. Watch for `[pageup] Thread: inner scroll N/M replies` progress lines. When inner scroll is stuck at exactly N−1 replies for ``MAX_THREAD_N_MINUS_ONE_STALL`` stall steps (~5 s), it exits early with a ⚠️ warning; the full ~60 s stall budget applies only when the count is less than N−1. A ✅ is logged when the full count is reached; ⚠️ is logged for partial collection. Partial threads are retried on later scroll batches. Transient open failures retry until ``MAX_THREAD_OPEN_ATTEMPTS``.
+- **Image attachments stay ``null`` or look like previews (~90 px)** — pageup saves originals under ``{write-dir}/…/attachments/`` via in-page fetch from the gallery overlay (``🖼️ Image: saved …``). Watch for ``⚠️ Image:`` when the gallery fetch fails or the payload is still thumbnail-sized. The gallery is ``position: fixed`` (``offsetParent === null``); older builds could not see the overlay in JS, so fetch timed out, close failed, and the preview stayed open. Current code detects visibility via ``getBoundingClientRect``, supports ``ImageGalleryUi`` and ``ImageGalleryV2`` roots, and falls back to a canvas read when ``fetch`` fails. Older builds also clicked «Скачать» when closing (``buttons[-1]`` under ``flex-end``); that is fixed via the ✕ icon plus CDP ``Page.setDownloadBehavior: deny``.
+- **Run stalls with video playing in the gallery** — inline **video** attachments (``VideoMedia-`` / ``PhotoVideoMedia-``) are ignored at parse time, never clicked, and if a video player opens anyway pageup pauses it, closes the overlay immediately, logs ``⚠️ Image: skipping video attachment …``, and does not retry (slot marked skipped, omitted from JSON).
+- **Main scroll repeats the same messages (panel stuck open)** — if the discussion panel stays open, `PAGE_UP` scrolls the thread pane instead of the main feed. pageup closes the panel (close button, then main-feed focus) and refocuses the main feed before each scroll. Watch for `panel still open after close attempt` lines. If you see `discussion panel did not open for message` with a different `panel root`, the previous thread panel did not close before the next bubble was clicked — focus the main chat once manually and re-run.
+- **Group chat closes during thread collection (`Main feed MessageList not found`)** — pageup does not send Escape (Escape navigates SberChat back to the chat list). After the first failure it skips remaining thread bubbles in the batch. Re-open the group chat and re-run.
+- **Thread bubble does not open the panel** — pageup clicks the green bubble via JavaScript only (never message bodies). Close any SberChat modal (e.g. the ``/model`` picker) manually if the run keeps failing on the same message.
+- **`no such element` for ``data-message-id`` when opening a thread** — SberChat unmounts off-screen rows; pageup scrolls the main feed to locate the row before clicking the bubble. If this still fails after ``MAX_THREAD_ROW_SEARCH_STEPS``, the message may have left the loaded history window — scroll the chat manually to that date and re-run.
 - **Graphics / VSync errors in browser log** — harmless on Sigma VMs; can be ignored.
 
 ### Fedora (personal device)
