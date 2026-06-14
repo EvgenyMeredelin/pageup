@@ -199,8 +199,8 @@ def run(
             _log("Task parameters:")
             print(task.model_dump_json(ensure_ascii=False, indent=4), flush=True)
 
-            # Batches are newest-first per collect_messages(); write_json dedupes and
-            # orders chronologically (oldest first) before writing the JSON file.
+            # Batches are newest-first per collect_messages(); extend_fresh dedupes
+            # truthy in-range rows on extend; write_json orders chronologically.
 
             # ── Phase 2: setup countdown (operator scrolls to latest message) ───
             # Cert/OTP often finish during navigation; this window is for scroll
@@ -215,12 +215,24 @@ def run(
             # Termination order inside each iteration (non-empty branch):
             #   1. is_done on oldest visible row — normal completion
             #   2. stall guard — history exhausted or min_date unreachable
-            #   3. extend batch and scroll up for more history
-            # seen_ids tracks message_id across overlapping viewport snapshots.
+            #   3. extend_fresh (deduped, in-range, truthy rows) and scroll up
+            # seen_ids tracks visible message_id for stall detection; collected_ids
+            # tracks unique truthy in-range IDs appended to messages.
             empty_scroll_attempts = 0
             seen_ids: set[str] = set()
+            collected_ids: set[str] = set()
             stall_attempts = 0
             scroll_iteration = 0
+
+            def extend_fresh(batch: list[Message]) -> None:
+                fresh = [
+                    m for m in batch
+                    if m and not task.is_done(m) and m.message_id not in collected_ids
+                ]
+                if fresh:
+                    collected_ids.update(m.message_id for m in fresh)
+                    messages.extend(fresh)
+
             while True:
                 scroll_iteration += 1
                 # Parse the current viewport.
@@ -267,13 +279,12 @@ def run(
                     # only the in-range subset of the current batch (messages
                     # that are at or after min_date) before writing, so that
                     # the final page snapshot is not silently dropped.
-                    valid_tail = [m for m in new_messages if not task.is_done(m)]
-                    messages.extend(valid_tail)
+                    extend_fresh(new_messages)
                     _finish(task, messages, write_dir)
                     break
 
                 if any(m.message_id not in seen_ids for m in new_messages):
-                    # At least one row in this viewport has not been collected yet.
+                    # At least one row in this viewport has not been seen before.
                     stall_attempts = 0
                     seen_ids.update(m.message_id for m in new_messages)
                 else:
@@ -297,16 +308,16 @@ def run(
                         _finish(task, messages, write_dir)
                         break
 
+                # Non-terminal batches: extend_fresh appends only new truthy in-range
+                # rows.  Per-row is_done filter handles DOM order that is not strictly
+                # chronological (see test_run_is_done_takes_precedence).
+                extend_fresh(new_messages)
+
                 if scroll_iteration % SCROLL_PROGRESS_INTERVAL == 0:
                     _log(
-                        f"Scroll batch: collected so far={len(messages)}, "
+                        f"Scroll batch: collected so far={len(collected_ids)}, "
                         f"visible rows={len(new_messages)}"
                     )
-
-                # Non-terminal batches: extend only in-range rows; write_json dedupes
-                # overlapping snapshots.  Per-row is_done filter handles DOM order that
-                # is not strictly chronological (see test_run_is_done_takes_precedence).
-                messages.extend(m for m in new_messages if not task.is_done(m))
 
                 # Keys.PAGE_UP * 20 sends twenty PAGE_UP events in one batch —
                 # a large upward jump to trigger SberChat's lazy history loading.
@@ -338,9 +349,11 @@ def _finish(task: ParsingTask, messages: list[Message], write_dir: str) -> None:
     KeyboardInterrupt, and unexpected errors — all exit paths persist partial
     collection before returning or re-raising.
 
-    Delegates deduplication, chronological ordering, and sender patching to
+    Delegates chronological ordering and sender patching to
     ``ParsingTask.write_json`` (see models.py postprocessor pipeline).
+    The summary count matches JSON output (unique, truthy messages).
     """
     Path(write_dir).mkdir(parents=True, exist_ok=True)
-    _log(f"Messages collected: {len(messages)}")
+    unique = ParsingTask._unique_reversed(messages)
+    _log(f"Messages collected: {len(unique)}")
     task.write_json(messages, write_dir)

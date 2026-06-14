@@ -16,11 +16,13 @@ Key scenarios:
     MAX_STALL_SCROLL_ATTEMPTS aborts when history is exhausted before min_date
     Stall counter resets when a fresh message_id appears
     is_done completion takes precedence over stall abort
-    is_done with empty valid_tail writes empty JSON
+    is_done with no in-range rows on final snapshot writes empty JSON
     Non-terminal extend excludes rows before min_date (DOM order != chronology)
     Stall progress logging mirrors empty-scroll progress logging
+    Stall does not inflate collected-so-far or Messages collected counts
 """
 
+import re
 import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -139,10 +141,9 @@ class RunTests(unittest.TestCase):
         mock_driver.quit.assert_called_once()
         mock_write.assert_called_once()
         messages = mock_write.call_args.args[0]
-        # First batch adds msg-new; second adds in-range tail only (msg-old is before min_date).
-        # write_json dedupes duplicate msg-new snapshots from overlapping scroll pages.
-        self.assertEqual(len(messages), 2)
-        self.assertTrue(all(m.message_id == "msg-new" for m in messages))
+        # First batch adds msg-new; second batch overlaps but does not re-append it.
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].message_id, "msg-new")
         self.assertNotIn("msg-old", {m.message_id for m in messages})
 
     # ── KeyboardInterrupt (partial output) ───────────────────────────────────
@@ -508,9 +509,11 @@ class RunTests(unittest.TestCase):
         mock_write.assert_called_once()
         mock_driver.quit.assert_called_once()
         messages = mock_write.call_args.args[0]
-        self.assertTrue(any(m.message_id == "msg-a" for m in messages))
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].message_id, "msg-a")
         printed = " ".join(str(c.args[0]) for c in mock_print.call_args_list if c.args)
         self.assertIn("min_date may predate chat history", printed)
+        self.assertIn("Messages collected: 1", printed)
 
     @patch("builtins.print")
     @patch("pageup.runner.MAX_STALL_SCROLL_ATTEMPTS", 5)
@@ -548,7 +551,8 @@ class RunTests(unittest.TestCase):
         mock_driver.quit.assert_called_once()
         self.assertEqual(page_source_mock.call_count, 10)
         messages = mock_write.call_args.args[0]
-        self.assertIn("msg-b", {m.message_id for m in messages})
+        self.assertEqual(len(messages), 2)
+        self.assertEqual({m.message_id for m in messages}, {"msg-a", "msg-b"})
         printed = " ".join(str(c.args[0]) for c in mock_print.call_args_list if c.args)
         self.assertIn("min_date may predate chat history", printed)
 
@@ -634,13 +638,53 @@ class RunTests(unittest.TestCase):
         self.assertIn("stall attempt 10/10", printed)
 
     @patch("builtins.print")
+    @patch("pageup.runner.MAX_STALL_SCROLL_ATTEMPTS", 10)
     @patch("pageup.runner.ActionChains")
     @patch("pageup.runner.time.sleep")
     @patch("pageup.runner.create_driver")
-    def test_run_is_done_with_empty_valid_tail(
+    def test_run_stall_does_not_inflate_collected_count(
+        self, mock_create, mock_sleep, mock_actions_cls, mock_print
+    ) -> None:
+        # Repeated identical viewport during stall must not grow collected so far.
+        mock_driver = MagicMock()
+        mock_create.return_value = mock_driver
+        mock_actions_cls.return_value = MagicMock()
+        single_msg = message_row("msg-a", TS_2024_09_01, content="only")
+        type(mock_driver).page_source = PropertyMock(side_effect=[single_msg] * 11)
+        task = ParsingTask(
+            name="runtest",
+            group_url=GROUP_URL,
+            min_date=datetime(2020, 1, 1, tzinfo=moscow_timezone),
+        )
+
+        with patch.object(ParsingTask, "write_json") as mock_write:
+            run(
+                task,
+                trusted_device=False,
+                sleep_time=1,
+                write_dir="/tmp/runtest-out",
+            )
+
+        messages = mock_write.call_args.args[0]
+        self.assertEqual(len(messages), 1)
+        printed = " ".join(str(c.args[0]) for c in mock_print.call_args_list if c.args)
+        counts = [
+            int(m.group(1))
+            for m in re.finditer(r"collected so far=(\d+)", printed)
+        ]
+        self.assertTrue(counts)
+        self.assertEqual(len(set(counts)), 1)
+        self.assertEqual(counts[0], 1)
+        self.assertIn("Messages collected: 1", printed)
+
+    @patch("builtins.print")
+    @patch("pageup.runner.ActionChains")
+    @patch("pageup.runner.time.sleep")
+    @patch("pageup.runner.create_driver")
+    def test_run_is_done_with_no_in_range_rows(
         self, mock_create, mock_sleep, mock_actions_cls, _mock_print
     ) -> None:
-        # All visible rows predate min_date — valid_tail is empty, prior batches empty.
+        # All visible rows predate min_date — nothing in-range to extend, prior batches empty.
         old_html = message_row("msg-old", TS_2024_01_15, content="too old")
         mock_driver = MagicMock()
         mock_create.return_value = mock_driver

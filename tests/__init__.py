@@ -9,7 +9,8 @@ Module map:
     test_runner.py  — scroll loop, create_driver wiring, page-load timeout,
                       progress logging, KeyboardInterrupt and fatal-error partial
                       write, regression (final-batch tail), empty-scroll and
-                      stall abort, is_done precedence, in-range extend filter
+                      stall abort, is_done precedence, in-range extend filter,
+                      stall count regression (no duplicate inflation)
     test_cli.py     — Typer CLI (--version, __main__ import guard, python3 -m
                       subprocess, group-url/name validation incl. empty name,
                       path separators, dot names, null bytes, dotted names,

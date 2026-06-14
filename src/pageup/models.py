@@ -359,7 +359,9 @@ class ParsingTask(BaseModel):
         Parameters
         ----------
         messages:
-            Raw accumulated message list (may contain duplicates, newest-first).
+            Accumulated message list from the runner (unique by
+            ``message_id``, newest-first).  ``_unique_reversed`` still
+            deduplicates defensively before writing.
         write_dir:
             Directory in which to write the output file.  Created by the
             caller before this method is invoked.
