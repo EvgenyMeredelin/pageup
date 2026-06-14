@@ -1,12 +1,19 @@
-# Python-generated files
+# ── Python build artefacts ────────────────────────────────────────────────────
+# Bytecode and C-extension caches produced by the interpreter.
 __pycache__/
 *.py[oc]
+
+# Directories created by `python -m build` or hatchling when packaging.
 build/
-dist/
+dist/*
+!dist/.gitignore
 wheels/
 *.egg-info
 
-# Virtual environments
+# ── Local virtual environment ─────────────────────────────────────────────────
+# Created by `uv sync --frozen` on the dev machine.  Not copied to Sigma —
+# Sigma uses the pageup-sigma library tarball (pack-for-sigma-docker.sh).
 .venv
 
-results/
+# uv.lock is committed (not ignored) — used by `uv sync --frozen` (dev) and
+# pack-for-sigma.sh (export).  Sigma tarball: dist/pageup-sigma-*.tar.gz (ignored via dist/*).
