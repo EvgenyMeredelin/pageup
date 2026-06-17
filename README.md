@@ -1,7 +1,7 @@
 <!-- pageup README — explicit <a id> anchors for TOC; section headers use · [↑](#toc). -->
 
 <p align="center">
-  <img src="assets/pageup-logo.png" alt="pageup logo" width="300">
+  <img src="assets/pageup-logo.png" alt="pageup logo" width="600">
 </p>
 
 <h1 align="center">pageup</h1>
