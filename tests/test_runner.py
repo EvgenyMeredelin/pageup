@@ -34,7 +34,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 from bs4 import BeautifulSoup
 
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from pageup.config import (
     MAX_EMPTY_SCROLL_ATTEMPTS,
@@ -110,6 +110,56 @@ class CreateDriverTests(unittest.TestCase):
         mock_chrome.return_value.execute_cdp_cmd.assert_called_once_with(
             "Page.setDownloadBehavior", {"behavior": "deny"}
         )
+
+    @patch("pageup.runner.Chrome")
+    @patch("pageup.runner.Service")
+    def test_cdp_webdriver_exception_is_swallowed(
+        self, mock_service, mock_chrome
+    ) -> None:
+        # Regression guard: a 0.2.0 build lacked the WebDriverException import,
+        # turning this expected, caught failure into an uncaught NameError that
+        # left Sberbrowser orphaned on data:, (see runner.py create_driver).
+        mock_driver = MagicMock()
+        mock_driver.execute_cdp_cmd.side_effect = WebDriverException("cdp unsupported")
+        mock_chrome.return_value = mock_driver
+
+        driver = create_driver(trusted_device=True)
+
+        self.assertIs(driver, mock_driver)
+        mock_driver.quit.assert_not_called()
+
+    @patch("pageup.runner.Chrome")
+    @patch("pageup.runner.Service")
+    def test_unexpected_failure_quits_driver_before_reraising(
+        self, mock_service, mock_chrome
+    ) -> None:
+        # Any failure other than the expected CDP WebDriverException must not
+        # leak the already-launched browser window: quit it, then propagate.
+        mock_driver = MagicMock()
+        mock_driver.execute_cdp_cmd.side_effect = RuntimeError("boom")
+        mock_chrome.return_value = mock_driver
+
+        with self.assertRaises(RuntimeError):
+            create_driver(trusted_device=True)
+
+        mock_driver.quit.assert_called_once()
+
+    @patch("pageup.runner.Chrome")
+    @patch("pageup.runner.Service")
+    def test_personal_device_timeout_failure_quits_driver_before_reraising(
+        self, mock_service, mock_chrome
+    ) -> None:
+        # Personal-device branch: set_page_load_timeout runs before the CDP call
+        # and must be covered by the same cleanup guard.
+        mock_driver = MagicMock()
+        mock_driver.set_page_load_timeout.side_effect = WebDriverException("no such window")
+        mock_chrome.return_value = mock_driver
+
+        with self.assertRaises(WebDriverException):
+            create_driver(trusted_device=False)
+
+        mock_driver.quit.assert_called_once()
+        mock_driver.execute_cdp_cmd.assert_not_called()
 
 
 class RunTests(unittest.TestCase):

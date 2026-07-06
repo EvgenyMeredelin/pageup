@@ -5,7 +5,7 @@
 # Distribution name and importable package are both "pageup" (see [project.scripts]).
 [project]
 name = "pageup"
-version = "0.2.0"
+version = "0.2.1"
 description = "Collect SberChat group messages and thread replies, write JSON"
 readme = "README.md"
 # Python 3.13+ is required for the `type` soft-keyword (models.MsgDump) and

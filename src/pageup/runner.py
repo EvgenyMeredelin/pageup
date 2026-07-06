@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 
 from bs4 import BeautifulSoup
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver import Chrome
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -112,6 +112,13 @@ def create_driver(*, trusted_device: bool) -> Chrome:
 
     Both modes call ``Page.setDownloadBehavior: deny`` so accidental gallery
     «Скачать» clicks cannot fill ``~/Downloads``.
+
+    Exception safety: once ``Chrome(...)`` has launched, any unexpected failure
+    while finishing setup (``set_page_load_timeout`` on the personal branch, or
+    the CDP call) quits that browser instance before re-raising, so a failure
+    here never leaves an orphaned window sitting on ``data:,``.  The one
+    expected, harmless failure — ``WebDriverException`` from the CDP call — is
+    swallowed instead, matching pre-0.2.1 behavior.
     """
     if trusted_device:
         # Exact 83b9d71 Sigma driver options — do not add extra Chromium flags
@@ -132,12 +139,26 @@ def create_driver(*, trusted_device: bool) -> Chrome:
         options.binary_location = YANDEX_BROWSER_BINARY
         service = Service(YANDEX_DRIVER)
         driver = Chrome(options=options, service=service)
-        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SEC)
 
+    # Any unexpected failure past this point must still close the already-launched
+    # browser — otherwise it is orphaned on its default blank page (data:,) with
+    # no navigation ever attempted (see e.g. the WebDriverException-import
+    # regression that shipped in 0.2.0).  Only the specific, expected
+    # WebDriverException from the CDP call below is swallowed; anything else is
+    # cleaned up and re-raised so run()'s error handling still sees it.
     try:
-        driver.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "deny"})
-    except WebDriverException:
-        pass
+        if not trusted_device:
+            driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SEC)
+        try:
+            driver.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "deny"})
+        except WebDriverException:
+            pass
+    except Exception:
+        try:
+            driver.quit()
+        except Exception:
+            pass  # best-effort cleanup; do not mask the original exception
+        raise
 
     return driver
 

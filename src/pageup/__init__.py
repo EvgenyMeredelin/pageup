@@ -43,4 +43,4 @@ End-to-end data path:
 
 # Public version string; mirrored in pyproject.toml [project].version and
 # printed by ``pageup --version`` or ``python3 -m pageup --version`` (cli._version_callback).
-__version__ = "0.2.0"
+__version__ = "0.2.1"
