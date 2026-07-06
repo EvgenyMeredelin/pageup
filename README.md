@@ -156,7 +156,7 @@ for Sigma.  See [Build artefacts in `dist/`](#build-artefacts-in-dist) for what
 every file in `dist/` is, what you can delete, and why.
 
 ```
-pageup-sigma-0.2.1-linux-x86_64.tar.gz
+pageup-sigma-0.2.2-linux-x86_64.tar.gz
   pageup-sigma/
     lib/python3.13/site-packages/   # pageup + all locked cp313 wheels
     README-SIGMA.txt
@@ -198,7 +198,7 @@ After `bash scripts/pack-for-sigma-docker.sh`, several files appear under
 ### What is a tarball?
 
 A **tarball** is a single compressed archive — here,
-`pageup-sigma-0.2.1-linux-x86_64.tar.gz`.  The `.tar` part collects a directory
+`pageup-sigma-0.2.2-linux-x86_64.tar.gz`.  The `.tar` part collects a directory
 tree into one file; `.gz` compresses it with gzip.  On Sigma you unpack it with
 `tar xzf …`, which recreates the `pageup-sigma/` folder under `~/projects`.
 It is the Linux equivalent of a zip file: one file to upload via `oait-bucket`,
@@ -241,12 +241,12 @@ on Fedora.
 Both are side effects of `uv build`, which `pack-for-sigma.sh` runs before
 assembling the Sigma bundle:
 
-- **`pageup-0.2.1-py3-none-any.whl`** — a built copy of the pageup package.
+- **`pageup-0.2.2-py3-none-any.whl`** — a built copy of the pageup package.
   The pack script installs this wheel (plus locked dependencies) into
   `pageup-sigma/lib/python3.13/site-packages/`.  After the bundle tarball is
   built, the standalone wheel on Fedora serves no further purpose.
 
-- **`pageup-0.2.1.tar.gz`** — a source distribution (sdist) in the standard
+- **`pageup-0.2.2.tar.gz`** — a source distribution (sdist) in the standard
   Python packaging format.  Useful if you ever publish pageup to PyPI; **not
   used** in the Sigma deploy workflow at all.
 
@@ -769,6 +769,7 @@ pageup/
 - **`opening group URL` but no setup countdown** — complete cert/OTP first; on Sigma `driver.get()` blocks until navigation finishes.
 - **Browser opens to a stuck `data:,` tab — no SberChat, no `.p12` picker, no countdown, and the log stops right after `Launching browser…`** — `create_driver()` raised before `driver.get()` was ever called, so navigation never started; the already-launched Sberbrowser window is left open on its default blank page. A 0.2.0 build shipped with this exact bug: a missing `WebDriverException` import turned an expected, harmless `Page.setDownloadBehavior` CDP failure into an uncaught `NameError`. Fixed in 0.2.1 (the CDP failure is swallowed again, and any other unexpected failure now closes the orphaned window before re-raising instead of leaking it) — update the deployed Sigma bundle. If it still happens on 0.2.1+, check the terminal for a different `Fatal error:` line right after `Launching browser…` and treat it as a `create_driver` bug, not an auth problem.
 - **Browser open, group URL loaded, but no `.p12` certificate picker** — stop the run (Ctrl+C) and start again; authentication did not begin correctly. (Different from the `data:,` case above: here navigation actually reached SberChat.)
+- **Ctrl+C (or a dropped connection) during `Thread: opening discussion for message…` writes zero or far fewer messages than expected** — before 0.2.2, the whole in-flight scroll batch (including plain messages needing no thread enrichment at all) was only appended to the output *after* thread enrichment and image download both finished; an interrupt or `ConnectionResetError` mid-enrichment discarded the entire batch. Fixed in 0.2.2: each batch's base content is saved before enrichment starts, each thread's replies are saved as soon as they are collected, and each message's downloaded image attachments are saved as soon as they finish — so a `Fatal error:` (or Ctrl+C) mid-batch now only loses the specific message/step in progress, not already-collected messages, thread replies, or downloaded images.
 - **"Kerberos Unsupported" in window title** — `create_driver` must pass two separate `--disable-features` flags (`SberAuth`, then `SberSync`); they must never be combined into one flag.
 - **Run stops with `no messages found after repeated scrolling`** — no parseable message rows for ~30 s; wrong page, chat not loaded, or focus lost during the setup countdown.
 - **Run stops with `min_date may predate chat history`** — rows were visible but no new message IDs appeared for ~4 s; `min_date` is earlier than the chat's creation date or history is exhausted.

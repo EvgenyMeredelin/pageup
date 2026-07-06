@@ -674,6 +674,39 @@ class ParsingTaskTests(unittest.TestCase):
             1,
         )
 
+    def test_prefer_richer_message_preserves_downloaded_attachment(self) -> None:
+        # Regression: a message already fully downloaded can resurface in a
+        # later scroll batch's fresh DOM re-parse (thread-pending retry) with
+        # attachments reset to pending (None slots); the stale re-parse must
+        # not clobber the already-downloaded filename.
+        base = self._make_message("t1", "parent", TS_2024_09_01)
+        downloaded = base.model_copy(update={"attachments": ["t1_0.jpg"]})
+        fresh_reparse = base.model_copy(update={"attachments": [None]})
+        merged = ParsingTask.prefer_richer_message(downloaded, fresh_reparse)
+        self.assertEqual(merged.attachments, ["t1_0.jpg"])
+
+    def test_prefer_richer_message_takes_newly_downloaded_attachment(self) -> None:
+        # Normal direction: incoming has a freshly downloaded slot that the
+        # existing (pre-download) message doesn't have yet.
+        base = self._make_message("t1", "parent", TS_2024_09_01)
+        pending = base.model_copy(update={"attachments": [None]})
+        downloaded = base.model_copy(update={"attachments": ["t1_0.jpg"]})
+        merged = ParsingTask.prefer_richer_message(pending, downloaded)
+        self.assertEqual(merged.attachments, ["t1_0.jpg"])
+
+    def test_prefer_richer_message_preserves_attachments_when_incoming_has_none(
+        self,
+    ) -> None:
+        # incoming.attachments can be the bare value None (not a [None] list)
+        # when a re-parse finds no attachment blocks at all in the row — this
+        # must defer to existing's data, not wipe it, the same as the
+        # [None]-slot case above.
+        base = self._make_message("t1", "parent", TS_2024_09_01)
+        downloaded = base.model_copy(update={"attachments": ["t1_0.jpg"]})
+        no_attachments_found = base.model_copy(update={"attachments": None})
+        merged = ParsingTask.prefer_richer_message(downloaded, no_attachments_found)
+        self.assertEqual(merged.attachments, ["t1_0.jpg"])
+
     def test_thread_is_complete(self) -> None:
         base = self._make_message("t1", "parent", TS_2024_09_01)
         reply = Entry(

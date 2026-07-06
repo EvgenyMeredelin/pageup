@@ -290,6 +290,36 @@ def run(
                         fresh.append(message)
                 if not fresh:
                     return
+
+                def _merge(batch_to_merge: list[Message]) -> None:
+                    for message in batch_to_merge:
+                        message_id = message.message_id
+                        for index, existing in enumerate(messages):
+                            if existing.message_id == message_id:
+                                # Rebind to the merged result (not the raw incoming
+                                # message) before the completeness check below —
+                                # prefer_richer_message may keep existing's richer
+                                # thread_replies, and that richer state is what
+                                # determines whether the thread is actually done.
+                                message = ParsingTask.prefer_richer_message(
+                                    existing, message
+                                )
+                                messages[index] = message
+                                break
+                        else:
+                            messages.append(message)
+                        collected_ids.add(message_id)
+                        if ParsingTask.thread_is_complete(message):
+                            thread_collected_ids.add(message_id)
+
+                # Merge in stages so a failure partway through enrichment
+                # (dropped browser connection, Ctrl+C, etc.) never loses messages
+                # already computed: base content is saved before thread
+                # enrichment is attempted, each thread's replies are saved as
+                # soon as they are collected (on_message_enriched callback), and
+                # thread-enriched content is saved before image download is
+                # attempted.
+                _merge(fresh)
                 enriched = enrich_fresh_threads(
                     driver,
                     task,
@@ -297,22 +327,16 @@ def run(
                     thread_collected_ids=thread_collected_ids,
                     thread_open_attempts=thread_open_attempts,
                     write_dir=write_dir,
+                    on_message_enriched=lambda message: _merge([message]),
                 )
-                enriched = download_fresh_images(driver, write_dir, enriched)
-                for message in enriched:
-                    message_id = message.message_id
-                    for index, existing in enumerate(messages):
-                        if existing.message_id == message_id:
-                            message = ParsingTask.prefer_richer_message(
-                                existing, message
-                            )
-                            messages[index] = message
-                            break
-                    else:
-                        messages.append(message)
-                    collected_ids.add(message_id)
-                    if ParsingTask.thread_is_complete(message):
-                        thread_collected_ids.add(message_id)
+                _merge(enriched)
+                enriched = download_fresh_images(
+                    driver,
+                    write_dir,
+                    enriched,
+                    on_message_downloaded=lambda message: _merge([message]),
+                )
+                _merge(enriched)
 
             while True:
                 scroll_iteration += 1

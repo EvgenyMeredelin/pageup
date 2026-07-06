@@ -305,6 +305,36 @@ class Message(Entry):
             this["sender_name"] = that["sender_name"]
 
 
+def _merge_attachment_slots(
+    existing: list[str | None] | None, incoming: list[str | None] | None
+) -> list[str | None] | None:
+    """Merge two attachment-slot lists for the same message, per slot.
+
+    Each slot is ``None`` (pending download), ``""`` (explicitly skipped,
+    e.g. video), or a saved filename.  Only ``None`` means "still needs
+    work" — prefer whichever side has a resolved (non-``None``) value per
+    slot, defaulting to *incoming* when both are resolved.  A missing list
+    (``None`` instead of a list) on either side defers entirely to the other
+    side, so a re-parse that unexpectedly finds no attachment blocks at all
+    can never wipe out an already-collected attachments list.  Returns one
+    of the inputs unchanged (same object) when there is nothing to merge, so
+    callers can skip a copy in the common case.
+    """
+    if existing is None:
+        return incoming
+    if incoming is None:
+        return existing
+    if existing == incoming:
+        return incoming
+    length = max(len(existing), len(incoming))
+    merged = []
+    for i in range(length):
+        incoming_slot = incoming[i] if i < len(incoming) else None
+        existing_slot = existing[i] if i < len(existing) else None
+        merged.append(incoming_slot if incoming_slot is not None else existing_slot)
+    return incoming if merged == incoming else merged
+
+
 # ── ParsingTask ───────────────────────────────────────────────────────────────
 
 class ParsingTask(BaseModel):
@@ -428,7 +458,18 @@ class ParsingTask(BaseModel):
 
     @staticmethod
     def prefer_richer_message(existing: Message, incoming: Message) -> Message:
-        """Return *incoming* enriched with the more complete ``thread_replies``."""
+        """Return *incoming* enriched with the more complete ``thread_replies``
+        and ``attachments`` from *existing*.
+
+        The runner merges the same message multiple times across scroll
+        batches and enrichment stages: a message already fully collected
+        (thread replies, downloaded image attachments) can resurface in a
+        later batch's fresh DOM re-parse — with reset ``thread_replies``
+        (``None``) and ``attachments`` (pending ``None`` slots) — while it is
+        still pending a thread retry.  Comparing per-field richness instead of
+        blindly trusting *incoming* prevents that stale re-parse from
+        overwriting already-collected data.
+        """
         old_count = len(existing.thread_replies or [])
         new_count = len(incoming.thread_replies or [])
         thread_reply_count = (
@@ -436,24 +477,32 @@ class ParsingTask(BaseModel):
         )
 
         if new_count > old_count:
-            return incoming.model_copy(update={"thread_reply_count": thread_reply_count})
-        if old_count > new_count:
-            return incoming.model_copy(
+            result = incoming.model_copy(update={"thread_reply_count": thread_reply_count})
+        elif old_count > new_count:
+            result = incoming.model_copy(
                 update={
                     "thread_replies": existing.thread_replies,
                     "thread_reply_count": thread_reply_count,
                 }
             )
-        if old_count > 0 and existing.thread_replies and incoming.thread_replies:
+        elif old_count > 0 and existing.thread_replies and incoming.thread_replies:
             # Equal non-zero counts: keep existing replies (they may have richer data
             # from a prior full collection pass, e.g. sender names that were patched).
-            return incoming.model_copy(
+            result = incoming.model_copy(
                 update={
                     "thread_replies": existing.thread_replies,
                     "thread_reply_count": thread_reply_count,
                 }
             )
-        return incoming.model_copy(update={"thread_reply_count": thread_reply_count})
+        else:
+            result = incoming.model_copy(update={"thread_reply_count": thread_reply_count})
+
+        merged_attachments = _merge_attachment_slots(
+            existing.attachments, result.attachments
+        )
+        if merged_attachments is not result.attachments:
+            result = result.model_copy(update={"attachments": merged_attachments})
+        return result
 
     @staticmethod
     def thread_is_complete(message: Message) -> bool:

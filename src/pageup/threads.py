@@ -49,6 +49,7 @@ chat list.
 import base64
 import time
 from pathlib import Path
+from typing import Callable
 
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import (
@@ -1246,6 +1247,8 @@ def download_fresh_images(
     driver: Chrome,
     write_dir: str,
     messages: list[Message],
+    *,
+    on_message_downloaded: Callable[[Message], None] | None = None,
 ) -> list[Message]:
     """Download image attachments for *messages* that have undownloaded images.
 
@@ -1262,6 +1265,13 @@ def download_fresh_images(
 
     Returns a new list with the same ordering as *messages*; messages without
     image attachments are returned unchanged.
+
+    When *on_message_downloaded* is provided, it is called with each message as
+    soon as its own download step finishes (whether or not it needed any
+    downloads), rather than only after every message in *messages* has been
+    processed.  This lets the caller persist progress immediately, so a later
+    message's failure (dropped connection, Ctrl+C, etc.) cannot erase an
+    earlier message's already-downloaded image attachments.
     """
     if not any(_needs_image_download(m.attachments) for m in messages):
         return messages
@@ -1275,6 +1285,8 @@ def download_fresh_images(
     for message in messages:
         if not _needs_image_download(message.attachments):
             updated_messages.append(message)
+            if on_message_downloaded is not None:
+                on_message_downloaded(message)
             continue
 
         assert message.attachments is not None  # narrowing: _needs_image_download checked
@@ -1288,17 +1300,22 @@ def download_fresh_images(
                 f"for image download: {exc}"
             )
             updated_messages.append(message)
+            if on_message_downloaded is not None:
+                on_message_downloaded(message)
             continue
 
         new_attachments = _download_images_for_row(
             driver, write_dir, message.message_id, row, message.attachments
         )
         if new_attachments is message.attachments:
-            updated_messages.append(message)
+            updated_message = message
         else:
-            updated_messages.append(
-                message.model_copy(update={"attachments": new_attachments})
+            updated_message = message.model_copy(
+                update={"attachments": new_attachments}
             )
+        updated_messages.append(updated_message)
+        if on_message_downloaded is not None:
+            on_message_downloaded(updated_message)
 
     return updated_messages
 
@@ -1311,6 +1328,7 @@ def enrich_fresh_threads(
     thread_collected_ids: set[str],
     thread_open_attempts: dict[str, int] | None = None,
     write_dir: str | None = None,
+    on_message_enriched: Callable[[Message], None] | None = None,
 ) -> list[Message]:
     """Return *fresh* messages with ``thread_replies`` populated where applicable.
 
@@ -1326,6 +1344,13 @@ def enrich_fresh_threads(
 
     When *write_dir* is provided, thread-reply image attachments are downloaded
     inside ``_open_thread_and_collect`` while each panel is still open.
+
+    When *on_message_enriched* is provided, it is called with each message as
+    soon as its replies are collected — i.e. as the loop below progresses,
+    rather than only after every candidate in *fresh* has been processed.  This
+    lets the caller persist progress immediately, so a later candidate's
+    failure (dropped connection, Ctrl+C, etc.) cannot erase an earlier
+    candidate's already-collected replies.
     """
     open_attempts = thread_open_attempts if thread_open_attempts is not None else {}
     updates: dict[str, Message] = {}
@@ -1388,9 +1413,10 @@ def enrich_fresh_threads(
                 f"{message.message_id!r}"
             )
 
-        updates[message.message_id] = message.model_copy(
-            update={"thread_replies": replies}
-        )
+        enriched_message = message.model_copy(update={"thread_replies": replies})
+        updates[message.message_id] = enriched_message
+        if on_message_enriched is not None:
+            on_message_enriched(enriched_message)
 
     enriched = [
         updates.get(message.message_id, message)
