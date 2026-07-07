@@ -328,8 +328,8 @@ src/pageup/
 ├── __init__.py — Package metadata and version string
 ├── __main__.py — `python3 -m pageup` entry (Sigma deploy via PYTHONPATH)
 ├── cli.py      — Typer app; argv → ParsingTask → runner.run()
-├── runner.py   — Browser session, scroll loop, uncollected thread enrichment, panel close + main-feed focus, Ctrl+C handlers
-├── threads.py  — Discussion panel open/scroll/close (JS scroll/focus); bubble/close JS click; thread_replies
+├── runner.py   — Browser session, scroll loop, uncollected thread enrichment, image download, panel close + main-feed focus, Ctrl+C handlers
+├── threads.py  — Discussion panel open/scroll/close (JS scroll/focus); bubble/close JS click; thread_replies; image gallery fetch + download
 ├── models.py   — Pydantic Quote / Entry / Message / ParsingTask; HTML parsing, dedup, write_json
 ├── config.py   — Compile-time constants: paths, selectors, timing
 └── tools.py    — Text cleaning pipeline, URL pattern, Moscow timezone
@@ -649,10 +649,12 @@ Each run creates a fresh Moscow-timestamped subdirectory inside `--write-dir`; d
 | `thread_replies[].date` | string | Moscow time |
 | `thread_replies[].sender_url` | string \| null | reply author profile URL |
 | `thread_replies[].sender_name` | string \| null | reply author display name |
+| `thread_replies[].quotes` | array \| null | embedded inline reply previews inside a thread reply; `null` when absent |
 | `thread_replies[].attachments` | array \| null | downloaded image filenames (full-resolution via gallery); `null` when none |
 | `thread_replies[].content` | string | cleaned reply text |
 | `quotes` | array \| null | embedded inline reply previews (not thread replies) |
 | `quotes[].sender_name` | string \| null | quoted author; `null` when absent |
+| `quotes[].content` | string | cleaned quoted text |
 | `attachments` | array \| null | downloaded image filenames (e.g. `["…_0.png"]`); full-resolution via gallery click; `null` when none |
 
 **Continuation rows:** SberChat omits the sender header when the same person sends
@@ -690,6 +692,11 @@ the next `pageup` run.  On Sigma, edit the deployed copy at
 | `MAX_THREAD_PANEL_CLOSE_ATTEMPTS` | 3 | Close-button + main-feed refocus attempts before giving up on panel close |
 | `THREAD_PANEL_OPEN_TIMEOUT_SEC` | 10 | Wait for discussion panel after bubble click |
 | `THREAD_PANEL_CLOSE_TIMEOUT_SEC` | 3 | Wait after each panel-close attempt before trying main-feed refocus |
+| `IMAGE_GALLERY_OPEN_TIMEOUT_SEC` | 10 | Wait for gallery overlay after inline image click |
+| `IMAGE_GALLERY_LOAD_TIMEOUT_SEC` | 15 | Wait for full-resolution `<img>` to load inside the gallery |
+| `IMAGE_GALLERY_FETCH_TIMEOUT_SEC` | 25 | Combined open + load budget for in-page gallery fetch |
+| `IMAGE_GALLERY_CLOSE_TIMEOUT_SEC` | 3 | Wait for gallery overlay to disappear after close |
+| `MIN_FULL_IMAGE_PX` | 90 | Minimum pixel dimension for a gallery image to be saved (rejects ~90 px inline thumbnails) |
 
 ### Browser paths
 
@@ -721,6 +728,8 @@ stay aligned with production selectors.
 | `IMAGE_GALLERY_WRAP_CLS` / `IMAGE_GALLERY_V2_*` | Gallery overlay roots (`ImageGalleryUi`, `ImageGalleryV2` content/dialog) |
 | `IMAGE_GALLERY_IMG_CLS` | Full-resolution `<img>` inside the gallery |
 | `IMAGE_GALLERY_CLOSE_ICON_ARIA` | Gallery top-bar ✕ icon (`sbc_line_close_line`); used to close without triggering «Скачать» |
+| `IMAGE_GALLERY_TOPBAR_CLS` | Gallery top bar wrapper (`ImageGalleryUi-ImageGalleryTopBar`); scopes the ✕ icon and download button |
+| `IMAGE_GALLERY_DOWNLOAD_BTN_SEL` | Gallery download button (`Скачать`); identified so it is never clicked (Chrome saves to `~/Downloads`) |
 | `QUOTE_WRAP_CLS` | Embedded inline reply preview block |
 | `QUOTE_SENDER_NAME_CLS` / `QUOTE_CONTENT_SEL` | Quoted author and text |
 | `THREAD_BUBBLE_CLS` | Green "N ответа" thread bubble (click target) |
